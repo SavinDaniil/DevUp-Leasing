@@ -9,6 +9,7 @@ from telegram import (
     Update,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
+    KeyboardButton
 )
 from telegram.ext import (
     Application,
@@ -141,10 +142,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     /start — приветствие и краткое объяснение.
     """
     text = (
-        "Привет! Это бот для оценки рыночной стоимости предмета лизинга.\n\n"
-        "Нажми /analyze, чтобы начать анализ нового объекта."
+        "*Привет!* 👋\n\n"
+        "Я бот для оценки *рыночной стоимости предмета лизинга*.\n\n"
+        "Чтобы начать, нажми кнопку ниже или введи команду `/analyze` вручную.\n"
+        "_Я задам несколько вопросов про объект и покажу аналитику по рынку._"
     )
-    await update.message.reply_text(text)
+
+    keyboard = [[KeyboardButton("/analyze")]]
+    reply_markup = ReplyKeyboardMarkup(
+        keyboard,
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+    await update.message.reply_markdown(text, reply_markup=reply_markup)
+
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -190,10 +202,12 @@ async def handle_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     item_type = update.message.text.strip()
     context.user_data["item_type"] = item_type
 
-    await update.message.reply_text(
-        "Введите марку и модель (например, MAN TGS 26.440 или "
-        "«Буровая установка XYZ‑123»):",
-        reply_markup=ReplyKeyboardRemove(),
+    await update.message.reply_markdown(
+        "*Отлично!* Теперь введи марку и модель.\n\n"
+        "Например:\n"
+        "• *MAN TGS 26.440*\n"
+        "• *CAT 320D*\n"
+        "• *Буровая установка XYZ-123*"
     )
     return MODEL
 
@@ -208,7 +222,10 @@ async def handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     model = update.message.text.strip()
     context.user_data["brand_model"] = model
 
-    await update.message.reply_text("Введите год выпуска (например, 2019):")
+    await update.message.reply_markdown(
+        "Теперь укажи *год выпуска*.\n\n"
+        "_Важно_: используй формат *YYYY*, например *2019*."
+    )
     return YEAR
 
 
@@ -227,9 +244,12 @@ async def handle_year(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         return ConversationHandler.END
 
     if not is_valid_year(text):
-        await update.message.reply_text(
-            "Некорректный год. Введите год числом в формате 4 цифр, например: 2019."
-        )
+        await update.message.reply_markdown(
+            "⚠️ *Некорректный ввод.*\n\n"
+            "Попробуй ещё раз:\n"
+            "• год — в формате *2019*"
+            )
+
         return YEAR
 
     year = int(text)
@@ -272,39 +292,42 @@ async def handle_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         return ConversationHandler.END
 
     if not is_valid_price(raw_price):
-        await update.message.reply_text(
-            "Некорректная цена. Введите положительное число, например: "
-            "10500000 или 10 500 000."
+        await update.message.reply_markdown(
+            "⚠️ *Некорректный ввод.*\n\n"
+            "Попробуй ещё раз:\n"
+            "• цена — только число, например *10500000* или *10 500 000*"
         )
         return PRICE
 
     price = _cleanup_price(raw_price)
     context.user_data["declared_price"] = price
 
-    # Формируем резюме введённых данных
     item_type = context.user_data.get("item_type")
     brand_model = context.user_data.get("brand_model")
     year = context.user_data.get("year")
     params = context.user_data.get("params")
 
     summary = (
-        "Проверьте, всё ли верно:\n\n"
-        f"Тип: {item_type}\n"
-        f"Модель: {brand_model}\n"
-        f"Год выпуска: {year}\n"
-        f"Характеристики: {params}\n"
-        f"Заявленная стоимость: {price:,.0f} руб.\n\n"
-        "Запустить анализ?"
+        "*Проверь данные перед запуском анализа:*\n\n"
+        f"• *Тип:* `{item_type}`\n"
+        f"• *Модель:* `{brand_model}`\n"
+        f"• *Год выпуска:* `{year}`\n"
+        f"• *Характеристики:* `{params}`\n"
+        f"• *Заявленная стоимость:* `{price:,.0f}` руб.\n\n"
+        "Если всё верно — нажми *Да*.\n"
+        "Чтобы прервать — выбери *Отмена* или отправь `/cancel`."
     ).replace(",", " ")
 
     reply_keyboard = [["Да", "Отмена"]]
-    await update.message.reply_text(
-        summary,
-        reply_markup=ReplyKeyboardMarkup(
-            reply_keyboard, one_time_keyboard=True, resize_keyboard=True
-        ),
+    reply_markup = ReplyKeyboardMarkup(
+        reply_keyboard,
+        resize_keyboard=True,
+        one_time_keyboard=True,
     )
+
+    await update.message.reply_markdown(summary, reply_markup=reply_markup)
     return CONFIRM
+
 
 
 # ---------- ДИАЛОГ: ШАГ 7 — ПОДТВЕРЖДЕНИЕ И ВЫЗОВ BACKEND ----------
@@ -323,18 +346,25 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return ConversationHandler.END
 
     if not choice.startswith("да"):
-        await update.message.reply_text(
-            "Пожалуйста, выберите 'Да' для запуска анализа или 'Отмена' для выхода."
+        keyboard = [["Да", "Отмена"]]
+        reply_markup = ReplyKeyboardMarkup(
+            keyboard,
+            resize_keyboard=True,
+            one_time_keyboard=True,
         )
-        return CONFIRM
+        await update.message.reply_text(
+            "Пожалуйста, выберите вариант ниже:",
+            reply_markup=reply_markup,
+        )
+        return CONFIRM  # остаёмся на этом шаге
 
-    # Сообщение о начале анализа
-    await update.message.reply_text(
-        "Запускаю поиск аналогов и анализ рынка, это может занять до минуты...",
-        reply_markup=ReplyKeyboardRemove(),
+    # сюда попадаем только если пользователь выбрал «да»
+    await update.message.reply_markdown(
+        "🔍 *Запускаю анализ рынка...*\n\n"
+        "Сейчас я подберу аналогичные объекты и посчитаю отклонение "
+        "от заявленной стоимости. Это может занять до *1 минуты*."
     )
 
-    # Собираем данные для backend
     payload = {
         "item_type": context.user_data.get("item_type"),
         "brand_model": context.user_data.get("brand_model"),
@@ -355,13 +385,13 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return ConversationHandler.END
 
-    # Формируем текст для пользователя
     text = _build_result_text(result)
     if not text:
         text = "Сервис вернул пустой результат. Попробуйте позже."
 
     await update.message.reply_markdown(text)
     return ConversationHandler.END
+
 
 
 # ---------- ОТМЕНА ДИАЛОГА ----------
