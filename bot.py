@@ -1,8 +1,9 @@
 import os
 import logging
 from typing import Dict, Any
+from datetime import datetime
 
-import requests
+import httpx
 from dotenv import load_dotenv
 from telegram import (
     Update,
@@ -19,7 +20,6 @@ from telegram.ext import (
 )
 
 # ---------- ЛОГИ ----------
-
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -27,9 +27,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------- ЗАГРУЗКА КОНФИГА ----------
-
 load_dotenv()
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000/analyze")
 
@@ -37,7 +35,6 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не найден в .env")
 
 # ---------- СОСТОЯНИЯ ДИАЛОГА ----------
-
 TYPE, MODEL, YEAR, PARAMS, PRICE, CONFIRM = range(6)
 
 # ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
@@ -50,6 +47,30 @@ def _cleanup_price(raw: str) -> float:
     """
     cleaned = raw.replace(" ", "").replace(",", ".")
     return float(cleaned)
+
+
+def is_valid_year(text: str) -> bool:
+    if not text.isdigit():
+        return False
+    year = int(text)
+    current_year = datetime.now().year
+    return 1900 <= year <= current_year
+
+
+def is_valid_price(text: str) -> bool:
+    text = text.replace(" ", "").replace(",", ".")
+    try:
+        value = float(text)
+    except ValueError:
+        return False
+    return value > 0
+
+
+async def call_backend(payload: Dict[str, Any]) -> Dict[str, Any]:
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(BACKEND_URL, json=payload)
+        resp.raise_for_status()
+        return resp.json()
 
 
 def _build_result_text(result: Dict[str, Any]) -> str:
@@ -93,7 +114,7 @@ def _build_result_text(result: Dict[str, Any]) -> str:
             lines.append(
                 f"| {title} | {price_mln:.2f} | {params} | {source_name} |"
             )
-        lines.append("")  # пустая строка после таблицы
+        lines.append("")
 
     # Блок с цифрами
     if median_price is not None:
@@ -196,17 +217,22 @@ async def handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 async def handle_year(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
-    Сохраняем год выпуска, проверяем, что это число, спрашиваем характеристики.
+    Сохраняем год выпуска, проверяем, что это число и адекватный диапазон,
+    спрашиваем характеристики.
     """
     text = update.message.text.strip()
-    try:
-        year = int(text)
-    except ValueError:
+
+    if text == "/cancel":
+        await update.message.reply_text("Диалог отменён.")
+        return ConversationHandler.END
+
+    if not is_valid_year(text):
         await update.message.reply_text(
-            "Пожалуйста, введите год числом, например: 2019."
+            "Некорректный год. Введите год числом в формате 4 цифр, например: 2019."
         )
         return YEAR
 
+    year = int(text)
     context.user_data["year"] = year
 
     await update.message.reply_text(
@@ -241,15 +267,18 @@ async def handle_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     """
     raw_price = update.message.text.strip()
 
-    try:
-        price = _cleanup_price(raw_price)
-    except ValueError:
+    if raw_price == "/cancel":
+        await update.message.reply_text("Диалог отменён.")
+        return ConversationHandler.END
+
+    if not is_valid_price(raw_price):
         await update.message.reply_text(
-            "Не получилось распознать число. Введите стоимость ещё раз, "
-            "например: 10500000 или 10 500 000."
+            "Некорректная цена. Введите положительное число, например: "
+            "10500000 или 10 500 000."
         )
         return PRICE
 
+    price = _cleanup_price(raw_price)
     context.user_data["declared_price"] = price
 
     # Формируем резюме введённых данных
@@ -269,7 +298,6 @@ async def handle_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     ).replace(",", " ")
 
     reply_keyboard = [["Да", "Отмена"]]
-
     await update.message.reply_text(
         summary,
         reply_markup=ReplyKeyboardMarkup(
@@ -296,8 +324,7 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if not choice.startswith("да"):
         await update.message.reply_text(
-            "Пожалуйста, выберите 'Да' для запуска анализа или 'Отмена' "
-            "для выхода."
+            "Пожалуйста, выберите 'Да' для запуска анализа или 'Отмена' для выхода."
         )
         return CONFIRM
 
@@ -319,10 +346,8 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     logger.info("Отправка payload в backend: %s", payload)
 
     try:
-        resp = requests.post(BACKEND_URL, json=payload, timeout=30)
-        resp.raise_for_status()
-        result = resp.json()
-    except Exception as e:
+        result = await call_backend(payload)
+    except httpx.HTTPError as e:
         logger.exception("Ошибка при запросе к backend: %s", e)
         await update.message.reply_text(
             "Не удалось получить ответ от сервиса оценки. "
@@ -370,24 +395,12 @@ def main() -> None:
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("analyze", analyze_start)],
         states={
-            TYPE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_type)
-            ],
-            MODEL: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_model)
-            ],
-            YEAR: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_year)
-            ],
-            PARAMS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_params)
-            ],
-            PRICE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_price)
-            ],
-            CONFIRM: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_confirm)
-            ],
+            TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_type)],
+            MODEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_model)],
+            YEAR: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_year)],
+            PARAMS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_params)],
+            PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_price)],
+            CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_confirm)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
