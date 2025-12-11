@@ -1,0 +1,16 @@
+venv
+.venv
+env
+.env
+
+# кэш Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.mypy_cache/
+
+# IDE и служебные файлы
+.vscode/
+.idea/
+*.log
