@@ -194,6 +194,17 @@ input[type="number"]:focus {
     display: block;
 }
 
+.gear {
+    display: inline-block;
+    margin-right: 6px;
+    animation: gear-spin 1s linear infinite;
+}
+
+@keyframes gear-spin {
+    from { transform: rotate(0deg); }
+    to   { transform: rotate(360deg); }
+}
+
 /* ПРАВАЯ ПАНЕЛЬ (РЕЗУЛЬТАТ) */
 
 .right-panel {

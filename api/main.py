@@ -72,6 +72,7 @@ class DescribeResponse(BaseModel):
 
     market_report: MarketReport = {}
     analogs_details: list[AnalogDetail] = []
+    soursec: list[dict] = []
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -131,6 +132,31 @@ async def describe(request: DescribeRequest) -> DescribeResponse:
         offers_used = analysis.get("offers_used") or []
         analogs_details_raw = analysis.get("analogs_details") or []
 
+        # краткий список источников для фронта
+        sources_for_response: list[dict] = []
+        for o in offers_used[:10]:  # первые 10 объявлений
+            sources_for_response.append(
+                {
+                    "title": o.get("title"),
+                    "source": o.get("source"),
+                    "url": o.get("url"),
+                    "price_str": o.get("price_str"),
+                }
+            )
+
+        # краткий список источников для фронта
+        sources_for_response: list[dict] = []
+        for o in offers_used[:10]:  # первые 10 объявлений
+            sources_for_response.append(
+                {
+                    "title": o.get("title"),
+                    "source": o.get("source"),
+                    "url": o.get("url"),
+                    "price_str": o.get("price_str"),
+                }
+            )
+
+
         # Первое предложение (для базовых полей)
         first_offer = offers_used[0] if offers_used else {}
 
@@ -172,6 +198,7 @@ async def describe(request: DescribeRequest) -> DescribeResponse:
                 explanation=market_report.get("explanation"),
             ),
             analogs_details=analogs_for_response,
+            sources=sources_for_response,   # новая строка
         )
 
     except Exception as e:

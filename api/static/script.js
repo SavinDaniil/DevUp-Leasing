@@ -65,7 +65,7 @@ form.addEventListener("submit", async (e) => {
       throw new Error("Ошибка сервера: " + resp.status);
     }
 
-    const data = await resp.json();
+     const data = await resp.json();
     console.log("[DEBUG] Данные распарсены:", JSON.stringify(data, null, 2));
 
     // Задержка для эффекта
@@ -75,6 +75,7 @@ form.addEventListener("submit", async (e) => {
     currentAnalogIndex = 0;
 
     render(data, clientPrice);
+    renderSources(data.sources || []);   // новая строка
 
     loading.classList.remove("show");
     resultContent.classList.add("show");
@@ -213,3 +214,30 @@ function updateAnalogCounter() {
 
 prevBtn.addEventListener("click", prevAnalog);
 nextBtn.addEventListener("click", nextAnalog);
+
+function renderSources(sources) {
+  const list = document.getElementById("sourcesList");
+  if (!list) return;
+
+  list.innerHTML = "";
+
+  if (!sources || sources.length === 0) {
+    list.innerHTML =
+      "<li style='color: var(--muted); font-size: 12px;'>Источники не найдены</li>";
+    return;
+  }
+
+  sources.forEach((s) => {
+    const li = document.createElement("li");
+    const title = s.title || "Объявление";
+    const src = s.source ? ` (${s.source})` : "";
+    const price = s.price_str ? ` · ${s.price_str}` : "";
+
+    if (s.url) {
+      li.innerHTML = `<a href="${s.url}" target="_blank" rel="noopener noreferrer">${title}</a>${src}${price}`;
+    } else {
+      li.textContent = `${title}${src}${price}`;
+    }
+    list.appendChild(li);
+  });
+}

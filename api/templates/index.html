@@ -3,7 +3,8 @@
 <head>
     <meta charset="UTF-8" />
     <title>Анализатор имущества</title>
-    <link rel="stylesheet" href="/static/style.css" />
+    <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
+    <link rel="stylesheet" href="/static/style.css?v=2" />
 </head>
 <body>
 <div class="container">
@@ -14,7 +15,7 @@
 
         <form id="analyzeForm">
             <div class="form-group">
-                <label for="item">Предмет лизинга*</label>
+                <label for="item">Предмет лизинга</label>
                 <input
                     type="text"
                     id="item"
@@ -40,14 +41,14 @@
                         class="ai-btn active"
                         data-value="true"
                     >
-                        Использовать ИИ
+                        ✅ Использовать
                     </button>
                     <button
                         type="button"
                         class="ai-btn"
                         data-value="false"
                     >
-                        Только парсер
+                        ❌ Не использовать
                     </button>
                 </div>
                 <input type="hidden" id="useAI" value="true" />
@@ -72,7 +73,8 @@
             📋 Заполните форму и нажмите «Проанализировать»
         </div>
         <div id="loading" class="loading hidden">
-            ⚙️ Анализируем информацию...
+            <span class="gear">⚙️</span>
+            <span>Анализируем информацию...</span>
         </div>
     </div>
 
@@ -100,25 +102,34 @@
                 </div>
             </div>
 
-            <div id="commentSection" class="comment-section">
-                📂 Заполните форму слева, чтобы увидеть анализ.
-            </div>
+        <div id="commentSection" class="comment-section">
+            📂 Заполните форму слева, чтобы увидеть анализ.
+        </div>
 
-            <div class="analogs-section">
-                <h3>Анализ аналогов</h3>
-                <div id="analogCard" class="analog-card">
-                    <p style="color: var(--muted);">Аналоги появятся после анализа</p>
-                </div>
-                <div class="slider-controls">
-                    <button class="slider-btn prev">← Предыдущий</button>
-                    <span id="analogCounter">0/0</span>
-                    <button class="slider-btn next">Следующий →</button>
-                </div>
+        <div class="analogs-section">
+            <h3>Анализ аналогов</h3>
+            <div id="analogCard" class="analog-card">
+                <p style="color: var(--muted);">Аналоги появятся после анализа</p>
+            </div>
+            <div class="slider-controls">
+                <button class="slider-btn prev">← Предыдущий</button>
+                <span id="analogCounter">0/0</span>
+                <button class="slider-btn next">Следующий →</button>
             </div>
         </div>
-    </div>
-</div>
 
-<script src="/static/script.js"></script>
+        <div class="sources-section">
+            <h3>Использованные источники</h3>
+            <ul id="sourcesList" class="sources-list">
+                <li style="color: var(--muted); font-size: 12px;">
+                    Источники появятся после анализа
+                </li>
+            </ul>
+        </div>
+    </div> <!-- resultContent -->
+</div>     <!-- right-panel -->
+
+
+<script src="/static/script.js?v=2"></script>
 </body>
 </html>
