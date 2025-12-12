@@ -1,450 +1,124 @@
 <!DOCTYPE html>
 <html lang="ru">
 <head>
-  <meta charset="UTF-8" />
-  <title>Leasing Market Analyzer</title>
-  <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
-  <style>
-    :root {
-      --bg: #020617;
-      --card-bg: #020617;
-      --accent: #16a34a;
-      --accent-soft: rgba(34, 197, 94, 0.12);
-      --primary: #2563eb;   /* синий для кнопок/чипов */
-      --text: #e5e7eb;
-      --muted: #9ca3af;
-      --danger: #f97373;
-    }
-    * { box-sizing: border-box; }
-
-    body {
-      margin: 0;
-      min-height: 100vh;
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      /* тёмный сине‑фиолетовый градиент, как на макете */
-      background:
-        radial-gradient(circle at 0% 0%, #1d4ed8 0%, transparent 55%),
-        radial-gradient(circle at 100% 100%, #16a34a 0%, transparent 55%),
-        radial-gradient(circle at 100% 0%, #0f172a 0%, #020617 55%);
-      color: var(--text);
-      display: flex;
-      align-items: stretch;
-      justify-content: center;
-    }
-
-    .container {
-      width: 100%;
-      max-width: 1100px;
-      padding: 32px 16px;
-      display: grid;
-      grid-template-columns: minmax(0, 420px) minmax(0, 1fr);
-      gap: 24px;
-    }
-    @media (max-width: 900px) {
-      .container {
-        grid-template-columns: 1fr;
-      }
-    }
-
-    .panel {
-      background: radial-gradient(circle at top left, rgba(37,99,235,0.35), transparent 55%),
-                  radial-gradient(circle at bottom right, rgba(16,185,129,0.25), transparent 55%),
-                  rgba(15,23,42,0.96);
-      border-radius: 24px;
-      padding: 24px 26px 22px;
-      box-shadow: 0 22px 55px rgba(15,23,42,0.9);
-      border: 1px solid rgba(148,163,184,0.28);
-    }
-
-    h1 {
-      margin: 0 0 4px;
-      font-size: 26px;
-      letter-spacing: 0.04em;
-    }
-    .subtitle {
-      font-size: 13px;
-      color: var(--muted);
-      margin-bottom: 18px;
-    }
-
-    label {
-      display: block;
-      font-size: 12px;
-      margin-top: 14px;
-      color: var(--muted);
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-    }
-
-    input {
-      width: 100%;
-      margin-top: 6px;
-      padding: 10px 12px;
-      background: rgba(15,23,42,0.96);
-      border-radius: 14px;
-      border: 1px solid rgba(30,64,175,0.7);
-      color: var(--text);
-      font-size: 14px;
-      outline: none;
-      transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
-    }
-    input::placeholder {
-      color: #6b7280;
-    }
-    input:focus {
-      border-color: #38bdf8;
-      box-shadow: 0 0 0 1px rgba(56,189,248,0.7);
-      background: #020617;
-    }
-
-    button {
-      margin-top: 22px;
-      width: 100%;
-      padding: 11px 14px;
-      border-radius: 999px;
-      border: none;
-      font-size: 14px;
-      font-weight: 600;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-      color: #e5e7eb;
-      /* синий → зелёный, как на твоей кнопке */
-      background: linear-gradient(135deg, #2563eb, #22c55e);
-      cursor: pointer;
-      box-shadow: 0 18px 40px rgba(37,99,235,0.55);
-      transition: transform 0.1s ease, box-shadow 0.1s ease, filter 0.15s;
-    }
-    button:hover {
-      transform: translateY(-1px);
-      box-shadow: 0 22px 48px rgba(37,99,235,0.65);
-      filter: brightness(1.04);
-    }
-    button:active {
-      transform: translateY(0);
-      box-shadow: 0 14px 30px rgba(37,99,235,0.55);
-    }
-
-    .pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 4px 10px;
-      border-radius: 999px;
-      background: rgba(15,23,42,0.9);
-      border: 1px solid rgba(56,189,248,0.45);
-      font-size: 11px;
-      color: var(--muted);
-      margin-bottom: 12px;
-    }
-    .pill-dot {
-      width: 7px;
-      height: 7px;
-      border-radius: 999px;
-      background: #22c55e;
-      box-shadow: 0 0 8px rgba(34,197,94,0.9);
-    }
-
-    .error {
-      color: var(--danger);
-      font-size: 13px;
-      margin-top: 10px;
-      background: rgba(220,38,38,0.12);
-      border-radius: 10px;
-      padding: 8px 12px;
-      border: 1px solid rgba(248,113,113,0.4);
-    }
-
-    .result-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: baseline;
-      gap: 8px;
-      margin-bottom: 12px;
-    }
-    .result-title {
-      font-size: 18px;
-      font-weight: 500;
-    }
-    .result-badge {
-      font-size: 11px;
-      padding: 4px 10px;
-      border-radius: 999px;
-      background: rgba(22,163,74,0.12);
-      color: #4ade80;
-      border: 1px solid rgba(34,197,94,0.6);
-    }
-
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 10px;
-      margin-bottom: 12px;
-    }
-    .metric {
-      padding: 9px 10px;
-      border-radius: 14px;
-      background: radial-gradient(circle at top left, rgba(37,99,235,0.18), transparent 60%),
-                  rgba(15,23,42,0.96);
-      border: 1px solid rgba(30,64,175,0.6);
-      font-size: 13px;
-    }
-    .metric-label {
-      font-size: 11px;
-      color: var(--muted);
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      margin-bottom: 3px;
-    }
-    .metric-value {
-      font-size: 14px;
-    }
-    .metric-good { color: #4ade80; }
-    .metric-bad { color: #fb7185; }
-
-    .comment {
-      margin-top: 6px;
-      font-size: 13px;
-      color: var(--muted);
-    }
-
-    .offers-list {
-      margin-top: 14px;
-      padding-top: 10px;
-      border-top: 1px dashed rgba(51,65,85,0.8);
-      max-height: 260px;
-      overflow-y: auto;
-    }
-    .offer-item {
-      padding: 7px 0;
-      border-bottom: 1px dashed rgba(30,64,175,0.35);
-      font-size: 13px;
-    }
-    .offer-title {
-      font-weight: 500;
-      margin-bottom: 2px;
-    }
-    .offer-meta {
-      font-size: 11px;
-      color: var(--muted);
-    }
-    .offer-link {
-      font-size: 11px;
-      color: #60a5fa;
-      text-decoration: none;
-    }
-    .offer-link:hover {
-      text-decoration: underline;
-    }
-    .placeholder {
-      font-size: 13px;
-      color: var(--muted);
-      margin-top: 4px;
-    }
-
-    /* анимация точек загрузки */
-    .loading-dots::after {
-      content: "";
-      display: inline-block;
-      width: 1.2em;
-      text-align: left;
-      animation: dots 1s steps(4, end) infinite;
-    }
-
-    @keyframes dots {
-      0%   { content: ""; }
-      25%  { content: "."; }
-      50%  { content: ".."; }
-      75%  { content: "..."; }
-      100% { content: ""; }
-    }
-  </style>
+    <meta charset="UTF-8" />
+    <title>Анализатор имущества</title>
+    <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
-  <div class="container">
-    <!-- Левая панель: форма -->
-    <div class="panel">
-      <div class="pill">
-        <span class="pill-dot"></span>
-        Рыночные данные + AI
-      </div>
-      <h1>Leasing Market Analyzer</h1>
-      <div class="subtitle">
-        Оценка рыночной стоимости предмета лизинга за пару кликов.
-      </div>
+<div class="container">
+    <!-- Левая панель: ввод -->
+    <div class="left-panel">
+        <h1>Анализ имущества</h1>
+        <p class="subtitle">Оценка рыночной стоимости и поиск аналогов</p>
 
-      <form id="analyze-form">
-        <label>
-          Предмет лизинга
-          <input
-            type="text"
-            id="item"
-            placeholder="Например: MAN TGS 26.440 2018"
-            required
-          />
-        </label>
+        <form id="analyzeForm">
+            <div class="form-group">
+                <label for="item">Предмет лизинга*</label>
+                <input
+                    type="text"
+                    id="item"
+                    placeholder="Например: BMW M5 2024"
+                    required
+                />
+            </div>
 
-        <label for="client_price">
-          Цена клиента, ₽ (опционально)
-        </label>
-        <input
-          type="number"
-          id="client_price"
-          name="client_price"
-          placeholder="Например, 6800000"
-        />
+            <div class="form-group">
+                <label for="clientPrice">Цена клиента (₽)</label>
+                <input
+                    type="number"
+                    id="clientPrice"
+                    placeholder="5000000"
+                />
+            </div>
 
-        <label for="num_results">
-          Число объявлений
-        </label>
-        <input
-          type="number"
-          id="num_results"
-          name="num_results"
-          value="5"
-          min="1"
-          max="20"
-        />
+            <div class="form-group">
+                <label>Использовать ИИ для анализа</label>
+                <div class="ai-toggle">
+                    <button
+                        type="button"
+                        class="ai-btn active"
+                        data-value="true"
+                    >
+                        Использовать ИИ
+                    </button>
+                    <button
+                        type="button"
+                        class="ai-btn"
+                        data-value="false"
+                    >
+                        Только парсер
+                    </button>
+                </div>
+                <input type="hidden" id="useAI" value="true" />
+            </div>
 
+            <div class="form-group">
+                <label for="numResults">Сколько аналогов искать</label>
+                <input
+                    type="number"
+                    id="numResults"
+                    min="1"
+                    max="20"
+                    value="5"
+                />
+            </div>
 
-        <button type="submit">Посчитать рыночную цену</button>
-      </form>
+            <button type="submit" class="submit-btn">Проанализировать</button>
+            <div id="error" class="error"></div>
+        </form>
 
-      <div class="error" id="error" style="display:none;"></div>
+        <div id="placeholder" class="placeholder">
+            📋 Заполните форму и нажмите «Проанализировать»
+        </div>
+        <div id="loading" class="loading hidden">
+            ⚙️ Анализируем информацию...
+        </div>
     </div>
 
     <!-- Правая панель: результат -->
-    <div class="panel">
-      <div id="placeholder" class="placeholder">
-        Результат появится здесь после запуска анализа. Попробуйте, например:
-        <strong>Komatsu PC200 2019</strong> или <strong>BMW X5 2021</strong>.
-      </div>
-      <div id="result" style="display:none;"></div>
+    <div class="right-panel">
+        <div id="resultContent" class="result-content">
+            <h2>Здесь будет результат анализа</h2>
+
+            <div class="metrics-grid">
+                <div class="metric">
+                    <div class="metric-label">Диапазон рынка</div>
+                    <div class="metric-value" id="rangeValue">—</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-label">Медиана</div>
+                    <div class="metric-value" id="medianValue">—</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-label">Цена клиента</div>
+                    <div class="metric-value" id="clientValue">—</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-label">Отклонение</div>
+                    <div class="metric-value" id="deviationValue">—</div>
+                </div>
+            </div>
+
+            <div id="commentSection" class="comment-section">
+                📂 Заполните форму слева, чтобы увидеть анализ.
+            </div>
+
+            <div class="analogs-section">
+                <h3>Анализ аналогов</h3>
+                <div id="analogCard" class="analog-card">
+                    <p style="color: var(--muted);">Аналоги появятся после анализа</p>
+                </div>
+                <div class="slider-controls">
+                    <button class="slider-btn prev">← Предыдущий</button>
+                    <span id="analogCounter">0/0</span>
+                    <button class="slider-btn next">Следующий →</button>
+                </div>
+            </div>
+        </div>
     </div>
-  </div>
+</div>
 
-  <script>
-    const form = document.getElementById('analyze-form');
-    const errorEl = document.getElementById('error');
-    const resultEl = document.getElementById('result');
-    const placeholderEl = document.getElementById('placeholder');
-
-    function formatPrice(val) {
-      if (val == null) return '—';
-      return new Intl.NumberFormat('ru-RU').format(val) + ' ₽';
-    }
-
-    form.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      errorEl.style.display = 'none';
-      errorEl.textContent = '';
-      placeholderEl.style.display = 'none';
-      resultEl.style.display = 'block';
-      resultEl.innerHTML =
-        '<div class="placeholder loading-dots">Загружаем рыночные данные</div>';
-
-      const item = document.getElementById('item').value.trim();
-      const clientPriceRaw = document.getElementById('client_price').value.trim();
-      const numResults = Number(document.getElementById('num_results').value || 5);
-
-      const payload = {
-        item,
-        client_price: clientPriceRaw ? Number(clientPriceRaw) : null,
-        num_results: numResults
-      };
-
-      try {
-        const resp = await fetch('/analyze', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json',
-          },
-          body: JSON.stringify(payload),
-        });
-
-        if (!resp.ok) {
-          const errData = await resp.json().catch(() => ({}));
-          throw new Error(errData.detail || ('Ошибка ' + resp.status));
-        }
-
-        const data = await resp.json();
-        const report = data.report;
-
-        const hasClient = report.client_price != null;
-        const priceOk = report.client_price_ok;
-
-        let html = '';
-
-        html += '<div class="result-header">';
-        html += `<div class="result-title">${report.item}</div>`;
-        if (hasClient) {
-          html += `<div class="result-badge">${priceOk ? 'Цена в рынке' : 'Отклонение от рынка'}</div>`;
-        }
-        html += '</div>';
-
-        html += '<div class="grid">';
-        html += '<div class="metric">';
-        html += '<div class="metric-label">Медианная цена</div>';
-        html += `<div class="metric-value">${formatPrice(report.median_price)}</div>`;
-        html += '</div>';
-
-        html += '<div class="metric">';
-        html += '<div class="metric-label">Рыночный диапазон</div>';
-        if (report.market_range) {
-          html += `<div class="metric-value">${formatPrice(report.market_range[0])} – ${formatPrice(report.market_range[1])}</div>`;
-        } else {
-          html += '<div class="metric-value">—</div>';
-        }
-        html += '</div>';
-
-        if (hasClient) {
-          html += '<div class="metric">';
-          html += '<div class="metric-label">Цена клиента</div>';
-          html += `<div class="metric-value ${priceOk ? 'metric-good' : 'metric-bad'}">${formatPrice(report.client_price)}</div>`;
-          html += '</div>';
-
-          html += '<div class="metric">';
-          html += '<div class="metric-label">Статус</div>';
-          html += `<div class="metric-value ${priceOk ? 'metric-good' : 'metric-bad'}">${priceOk ? 'OK (±20%)' : 'Выходит за ±20%'}</div>`;
-          html += '</div>';
-        }
-        html += '</div>'; // grid
-
-        html += `<div class="comment">${report.explanation || 'Комментарий не сформирован.'}</div>`;
-
-        html += `<div class="offers-list">`;
-        html += `<div class="metric-label" style="margin-bottom:4px;">Рыночные оферты (первые 5)</div>`;
-
-        if (report.offers_used.length === 0) {
-          html += '<div class="placeholder">Не удалось собрать предложения по этому объекту.</div>';
-        } else {
-          report.offers_used.slice(0, 5).forEach((o, idx) => {
-            html += '<div class="offer-item">';
-            html += `<div class="offer-title">[${idx + 1}] ${o.title}</div>`;
-            html += '<div class="offer-meta">';
-            html += `Источник: ${o.source}`;
-            if (o.year) html += ` • Год: ${o.year}`;
-            if (o.location) html += ` • ${o.location}`;
-            if (o.price_str) html += ` • ${o.price_str}`;
-            html += '</div>';
-            if (o.url) {
-              html += `<a class="offer-link" href="${o.url}" target="_blank" rel="noopener noreferrer">Открыть объявление</a>`;
-            }
-            html += '</div>';
-          });
-        }
-
-        html += '</div>'; // offers-list
-
-        resultEl.innerHTML = html;
-      } catch (err) {
-        resultEl.style.display = 'none';
-        placeholderEl.style.display = 'block';
-        placeholderEl.textContent = 'Результат появится здесь после успешного анализа.';
-        errorEl.style.display = 'block';
-        errorEl.textContent = err.message || 'Неизвестная ошибка';
-      }
-    });
-  </script>
+<script src="/static/script.js"></script>
 </body>
 </html>

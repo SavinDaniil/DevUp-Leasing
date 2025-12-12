@@ -1,232 +1,199 @@
-from typing import List, Optional
-
 import os
-from fastapi import FastAPI, HTTPException
+from pathlib import Path
+from typing import Optional
+
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from fastapi.responses import FileResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
-# Импортируем ваш парсер и аналитику из parser_b.py
-from parser_b import (
-    SeleniumFetcher,
-    LeasingAssetAnalyzer,
-    GIGACHAT_AUTH_DATA,
-    search_and_analyze,
-    analyze_market,
-)  # [file:42]
+from parser_b import run_analysis
 
-# Создаём FastAPI-приложение
-app = FastAPI(title="Leasing Asset Market Analyzer API")
+app = FastAPI(
+    title="Leasing descriptor API",
+    description="Рыночный анализ предмета лизинга + аналоги",
+    version="1.0.0",
+)
 
-BASE_DIR = os.path.dirname(__file__)
-static_dir = os.path.join(BASE_DIR, "static")
-templates_dir = os.path.join(BASE_DIR, "templates")
+BASE_DIR = Path(__file__).resolve().parent
+templates_dir = BASE_DIR / "templates"
+static_dir = BASE_DIR / "static"
 
-app.mount("/static", StaticFiles(directory=static_dir), name="static")
+if static_dir.exists():
+    app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
-@app.get("/", response_class=FileResponse)
-def root():
-    return FileResponse(os.path.join(templates_dir, "index.html"))
-
-# Включаем CORS, чтобы фронтенд (другой домен/порт) мог вызывать API из браузера
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],      # на проде лучше указать конкретный домен фронта
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# =========================
-# Pydantic-модели запроса/ответа
-# =========================
 
-class AnalyzeRequest(BaseModel):
-    item: str = Field(..., example="MAN TGS 26.440 2018", description="Что анализируем")
-    client_price: Optional[float] = Field(
-        None,
-        example=10500000,
-        description="Цена клиента в рублях (опционально)",
-    )
-    num_results: int = Field(
-        5,
-        ge=1,
-        le=20,
-        description="Сколько источников/страниц собирать для анализа",
-    )
+class DescribeRequest(BaseModel):
+    text: str
+    clientPrice: Optional[int] = None
 
 
-class OfferDTO(BaseModel):
-    """
-    Одна найденная рыночная оферта (объявление или предложение лизинга).
-    Это «чистый» формат для фронта.
-    """
-    title: str
-    url: str
-    source: str
+class AnalogDetail(BaseModel):
+    name: str
+    avg_price_guess: Optional[int] = None
+    note: Optional[str] = None
+    pros: list[str] = []
+    cons: list[str] = []
+
+
+class MarketReport(BaseModel):
+    item: Optional[str] = None
+    market_range: Optional[list[int]] = None
+    median_price: Optional[float] = None
+    mean_price: Optional[int] = None
+    client_price: Optional[int] = None
+    client_price_ok: Optional[bool] = None
+    explanation: Optional[str] = None
+
+
+class DescribeResponse(BaseModel):
+    category: Optional[str] = None
+    vendor: Optional[str] = None
     model: Optional[str] = None
     price: Optional[int] = None
-    price_str: Optional[str] = None
+    currency: Optional[str] = None
     monthly_payment: Optional[int] = None
-    monthly_payment_str: Optional[str] = None
-    price_on_request: Optional[bool] = None
     year: Optional[int] = None
-    power: Optional[str] = None
-    mileage: Optional[str] = None
-    vendor: Optional[str] = None
     condition: Optional[str] = None
     location: Optional[str] = None
     specs: dict = {}
-    category: Optional[str] = None
-    currency: Optional[str] = None
-    pros: List[str] = []
-    cons: List[str] = []
-    analogs: List[str] = []
-    analogs_suggested: List[str] = []
+    pros: list[str] = []
+    cons: list[str] = []
+    analogs_mentioned: list[str] = []
+
+    market_report: MarketReport = {}
+    analogs_details: list[AnalogDetail] = []
 
 
-class MarketReportDTO(BaseModel):
+@app.get("/", response_class=HTMLResponse)
+async def root() -> HTMLResponse:
+    index_path = templates_dir / "index.html"
+    if index_path.exists():
+        return HTMLResponse(index_path.read_text(encoding="utf-8"))
+    return HTMLResponse("<h1>index.html не найден</h1>", status_code=404)
+
+
+@app.post("/api/describe", response_model=DescribeResponse)
+async def describe(request: DescribeRequest) -> DescribeResponse:
     """
-    Итоговый отчёт по рынку, который строится на основе функций из parser_b.py.
+    Главный эндпоинт API.
+    1) Берёт text (склеённое описание) и clientPrice
+    2) Запускает run_analysis из parser_b.py
+    3) Преобразует результаты в DescribeResponse:
+       - market_report: диапазон, медиана, отклонение, комментарий
+       - analogs_details: список аналогов для карусели
     """
-    item: str
-    offers_used: List[OfferDTO]
-    analogs_suggested: List[str]
-    market_range: Optional[List[int]] = None    # [min_price, max_price]
-    median_price: Optional[float] = None
-    mean_price: Optional[float] = None
-    client_price: Optional[int] = None
-    client_price_ok: Optional[bool] = None
-    explanation: str = ""                       # человекочитаемый комментарий
-    ai_flag: Optional[str] = None               # например, "SUSPICIOUS"
-    ai_comment: Optional[str] = None            # комментарий от AI
+    item_str = request.text.strip()
+    client_price = request.clientPrice
 
-
-class AnalyzeResponse(BaseModel):
-    """
-    Обёртка для ответа API.
-    Можно в будущем добавить сюда поля 'request_id', 'timestamp' и т.д.
-    """
-    status: str = "ok"
-    report: MarketReportDTO
-
-
-# =========================
-# Эндпоинты API
-# =========================
-
-@app.get("/health")
-def health():
-    """
-    Простой health-check.
-    Можно использовать в мониторинге и для проверки, что сервис жив.
-    """
-    return {"status": "ok"}
-
-
-@app.post("/analyze", response_model=AnalyzeResponse)
-def analyze(req: AnalyzeRequest):
-    """
-    Основной endpoint:
-
-    1. Принимает описание предмета лизинга и цену клиента.
-    2. Запускает пайплайн из parser_b.py:
-       - поиск страниц (Google/обязательные источники),
-       - парсинг (Avito + другие сайты),
-       - AI-анализ (GigaChat) поверх HTML, где нужно.
-    3. Считает медиану и диапазон цен.
-    4. Возвращает структурированный отчёт для фронта.
-    """
-
-    # Приводим цену клиента к int (если она есть)
-    client_price = int(req.client_price) if req.client_price is not None else None
-
-    # Создаём Selenium-фетчер (один на запрос)
-    fetcher = SeleniumFetcher()
-
-    # На проде AI всегда включён
-    use_ai = True
-
-    # Создаём GigaChat-анализатор, который:
-    # - получает токен,
-    # - чистит HTML,
-    # - вытаскивает структуру через LLM.
-    analyzer = LeasingAssetAnalyzer(GIGACHAT_AUTH_DATA, fetcher)
+    print(f"[DEBUG] item={item_str[:80]}...")
+    print(f"[DEBUG] client_price={client_price}")
 
     try:
-        # Первый поисковый запрос: "<item> лизинг"
-        query = f"{req.item} лизинг"
+        try:
+            # Запускаем парсер
+            analysis = run_analysis(
+                item=item_str,
+                client_price=client_price,
+                use_ai=True,
+                num_results=5,
+            )
+        except OverflowError as e:
+            # Защита от int too large to convert to float
+            print(f"[WARN] Overflow в run_analysis: {e}")
+            analysis = {
+                "item": item_str,
+                "offers_used": [],
+                "analogs_suggested": [],
+                "analogs_details": [],
+                "market_report": {
+                    "item": item_str,
+                    "market_range": None,
+                    "median_price": None,
+                    "mean_price": None,
+                    "client_price": client_price,
+                    "client_price_ok": None,
+                    "explanation": "Не удалось посчитать диапазон: данные цен некорректны.",
+                },
+            }
 
-        # search_and_analyze — функция из parser_b.py:
-        # - делает поиск (Serper + обязательные источники),
-        # - парсит страницы Selenium'ом,
-        # - запускает AI, если use_ai = True,
-        # - фильтрует выбросы по ценам,
-        # - возвращает список LeasingOffer.
-        offers = search_and_analyze(
-            query,
-            fetcher=fetcher,
-            analyzer=analyzer,
-            num_results=req.num_results,
-            use_ai=use_ai,
-        )
+        # Извлекаем нужные части
+        market_report = analysis.get("market_report") or {}
+        offers_used = analysis.get("offers_used") or []
+        analogs_details_raw = analysis.get("analogs_details") or []
 
-        # Если по запросу "лизинг" ничего не нашли — пробуем «купить».
-        if not offers:
-            query_simple = f"{req.item} купить"
-            offers = search_and_analyze(
-                query_simple,
-                fetcher=fetcher,
-                analyzer=analyzer,
-                num_results=req.num_results,
-                use_ai=use_ai,
+        # Первое предложение (для базовых полей)
+        first_offer = offers_used[0] if offers_used else {}
+
+        # Преобразуем аналоги в формат, который ожидает фронт
+        analogs_for_response = []
+        for analog in analogs_details_raw:
+            analogs_for_response.append(
+                AnalogDetail(
+                    name=analog.get("name", "Аналог"),
+                    avg_price_guess=analog.get("avg_price_guess"),
+                    note=analog.get("note"),
+                    pros=analog.get("pros", []),
+                    cons=analog.get("cons", []),
+                )
             )
 
-        # Совсем пусто — отдаём 404, фронт покажет ошибку.
-        if not offers:
-            raise HTTPException(status_code=404, detail="Не удалось найти предложения")
-
-        # Статистический анализ рынка:
-        # analyze_market уже реализован в parser_b.py и возвращает dict
-        # с полями: market_range, median_price, client_price_ok, explanation и т.д.
-        report = analyze_market(req.item, offers, client_price)
-
-        # Преобразуем внутренние объекты LeasingOffer
-        # в Pydantic-модели OfferDTO, чтобы FastAPI вернул корректный JSON.
-        offers_dto: List[OfferDTO] = []
-        for o in report["offers_used"]:
-            if isinstance(o, dict):
-                offers_dto.append(OfferDTO(**o))
-            else:
-                # dataclass LeasingOffer -> используем __dict__
-                offers_dto.append(OfferDTO(**o.__dict__))
-
-        # Собираем объект отчёта для ответа
-        report_dto = MarketReportDTO(
-            item=report["item"],
-            offers_used=offers_dto,
-            analogs_suggested=report.get("analogs_suggested", []),
-            market_range=report.get("market_range"),
-            median_price=report.get("median_price"),
-            mean_price=report.get("mean_price"),
-            client_price=report.get("client_price"),
-            client_price_ok=report.get("client_price_ok"),
-            explanation=report.get("explanation", ""),
-            ai_flag=report.get("ai_flag"),
-            ai_comment=report.get("ai_comment"),
+        # Собираем ответ
+        return DescribeResponse(
+            category=first_offer.get("category"),
+            vendor=first_offer.get("vendor"),
+            model=first_offer.get("model"),
+            price=market_report.get("median_price"),
+            currency=first_offer.get("currency", "RUB"),
+            monthly_payment=first_offer.get("monthly_payment"),
+            year=first_offer.get("year"),
+            condition=first_offer.get("condition"),
+            location=first_offer.get("location"),
+            specs=first_offer.get("specs", {}),
+            pros=first_offer.get("pros", []),
+            cons=first_offer.get("cons", []),
+            analogs_mentioned=analysis.get("analogs_suggested", []),
+            market_report=MarketReport(
+                item=market_report.get("item"),
+                market_range=market_report.get("market_range"),
+                median_price=market_report.get("median_price"),
+                mean_price=market_report.get("mean_price"),
+                client_price=market_report.get("client_price"),
+                client_price_ok=market_report.get("client_price_ok"),
+                explanation=market_report.get("explanation"),
+            ),
+            analogs_details=analogs_for_response,
         )
 
-        # Финальный JSON-ответ API
-        return AnalyzeResponse(status="ok", report=report_dto)
-
-    except HTTPException:
-        # Уже готовая HTTP-ошибка (404/400 и т.п.) — пробрасываем как есть.
-        raise
     except Exception as e:
-        # Любая неожиданная ошибка — 500.
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        # В любом случае корректно закрываем Selenium-драйвер,
-        # чтобы не копились процессы Chrome.
-        fetcher.close()
+        print(f"[ERROR] /api/describe failed: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        return DescribeResponse(
+            category="Ошибка анализа",
+            vendor=str(e)[:100],
+            specs={},
+            pros=[],
+            cons=[],
+            analogs_mentioned=[],
+            market_report=MarketReport(
+                explanation=f"Ошибка: {str(e)[:200]}"
+            ),
+            analogs_details=[],
+        )
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
