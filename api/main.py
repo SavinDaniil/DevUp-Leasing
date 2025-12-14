@@ -70,9 +70,9 @@ class DescribeResponse(BaseModel):
     cons: list[str] = []
     analogs_mentioned: list[str] = []
 
-    market_report: MarketReport = {}
+    market_report: MarketReport = MarketReport()
     analogs_details: list[AnalogDetail] = []
-    soursec: list[dict] = []
+    sources: list[dict] = []
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -131,18 +131,6 @@ async def describe(request: DescribeRequest) -> DescribeResponse:
         market_report = analysis.get("market_report") or {}
         offers_used = analysis.get("offers_used") or []
         analogs_details_raw = analysis.get("analogs_details") or []
-
-        # краткий список источников для фронта
-        sources_for_response: list[dict] = []
-        for o in offers_used[:10]:  # первые 10 объявлений
-            sources_for_response.append(
-                {
-                    "title": o.get("title"),
-                    "source": o.get("source"),
-                    "url": o.get("url"),
-                    "price_str": o.get("price_str"),
-                }
-            )
 
         # краткий список источников для фронта
         sources_for_response: list[dict] = []

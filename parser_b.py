@@ -18,7 +18,7 @@ import sys
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
-from typing import Optional, Any
+from typing import Optional
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -28,8 +28,7 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 
 from dotenv import load_dotenv
-
-load_dotenv()
+load_dotenv
 
 # Ensure stdout handles UTF-8 on Windows to avoid mojibake in console.
 if sys.platform == "win32":
@@ -407,38 +406,35 @@ class LeasingAssetAnalyzer:
             "Accept": "application/json",
             "Authorization": f"Bearer {token}",
         }
-        system_prompt = """Ты — эксперт-аналитик лизингового оборудования, специализирующийся на анализе объявлений.
-Твоя задача — обработать описание автомобиля или техники и выдать структурированное заключение.
-Следуй следующим правилам:
+        system_prompt = """Ты аналитик рынка лизинга авто. По тексту объявления заполни поля и верни только JSON.
+Требуется:
+1) Категория (Category).
+2) Бренд и модель.
+3) 3–5 ключевых характеристик (Specs) — тип двигателя/привода, пробег, мощность/л.с., состояние и пр.
+4) Плюсы (Pros) и минусы/оговорки (Cons).
+5) Если в тексте упомянуты аналоги или конкуренты (например, “как Volvo ...”), добавь их в analogs_mentioned.
 
-Обязательные поля:
-1. Укажи категорию (Category).
-2. Назови марку и модель автомобиля/техники.
-3. Выдели 3–5 ключевых технических характеристик (Specs), которые важны для оценки стоимости и состояния. Примеры: мощность в л.с./кВт; пробег в км/моточасах; объём двигателя в литрах.
-4. Перечисли 3–5 преимуществ (Pros) и недостатков/рисков (Cons).
-5. Укажи все упомянутые аналоги конкурентов (например, «аналог Volvo...»), если таковые есть.
-
-Формат ответа (валидный JSON):
+Структура ответа:
 {
-  "category": "string (пример: 'Легковые автомобили', 'Строительная техника')",
-  "vendor": "string (производитель, например: 'КамАЗ', 'BMW')",
-  "model": "string (точная модель, например: 'КАМАЗ-6522', 'X5 M')",
-  "price": int (цена в рублях, null если указано 'не указано'),
+  "category": "string (например: 'легковые автомобили', 'коммерческий транспорт')",
+  "vendor": "string (производитель, например: 'Volvo', 'BMW')",
+  "model": "string (модель, например: 'XC60', 'X5 M')",
+  "price": int (цена в валюте, null если нет или “по запросу”),
   "currency": "string (RUB, USD, EUR)",
-  "monthly_payment": int (платёж в рублях, null если не указан),
+  "monthly_payment": int (платёж в месяц, null если нет),
   "year": int (год выпуска),
-  "condition": "string (новый / с пробегом / восстановленный)",
+  "condition": "string (новый / б/у / не указан)",
   "location": "string (город/регион)",
   "specs": {
-    "техническая_характеристика_1": "значение",
-    "техническая_характеристика_2": "значение",
-    "техническая_характеристика_3": "значение"
+    "характеристика_1": "значение",
+    "характеристика_2": "значение",
+    "характеристика_3": "значение"
   },
   "pros": ["плюс 1", "плюс 2"],
   "cons": ["минус 1", "минус 2"],
   "analogs_mentioned": ["аналог 1", "аналог 2"]
 }
-Верни только валидный JSON без markdown-обёртки."""
+Отдавай только JSON без markdown."""
 
         payload = {
             "model": "GigaChat-2",
@@ -456,7 +452,7 @@ class LeasingAssetAnalyzer:
             content = result["choices"][0]["message"]["content"]
             return safe_json_loads(content)
         except Exception as exc:
-            print(f"[!] GigaChat: {exc}")
+            print(f"[!] ?? ??????? ??????? GigaChat: {exc}")
             return None
 
     def fetch_page(self, url: str, scroll_times: int = 2, wait: float = 1.5) -> Optional[str]:
@@ -759,6 +755,7 @@ def collect_analogs(item_name: str, offers: list[LeasingOffer], use_ai: bool, an
                 candidate = parts[0].strip()
                 if candidate and len(candidate.split()) <= 6:
                     analogs_set.add(candidate)
+
     return [a for a in analogs_set if a]
 
 
@@ -1141,7 +1138,9 @@ def main():
         if fetcher:
             fetcher.close()
 
-# parser.py
+# =============================
+# Entry point for API
+# =============================
 
 def run_analysis(
     item: str,
@@ -1149,100 +1148,31 @@ def run_analysis(
     use_ai: bool = True,
     num_results: int = 5,
 ) -> dict:
-    """
-    Высокоуровневая точка входа для API.
-    """
-    if not item:
-        return {"error": "empty_item"}
-
     fetcher = SeleniumFetcher()
     analyzer = LeasingAssetAnalyzer(GIGACHAT_AUTH_DATA, fetcher) if use_ai else None
 
     try:
         query = f"{item} лизинг"
-        offers = search_and_analyze(query, fetcher, analyzer, num_results=num_results, use_ai=use_ai)
 
-        if not offers:
-            # fallback как в CLI
-            query_simple = f"{item} купить"
-            offers = search_and_analyze(query_simple, fetcher, analyzer, num_results=num_results, use_ai=use_ai)
+        offers = search_and_analyze(
+            query,        # 1) строка запроса
+            fetcher,      # 2) SeleniumFetcher
+            analyzer,     # 3) анализатор или None
+            num_results=num_results,
+            use_ai=use_ai,
+        )
 
-        if not offers:
-            return {
-                "item": item,
-                "offers_used": [],
-                "analogs_suggested": [],
-                "analogs_details": [],
-                "market_report": {
-                    "item": item,
-                    "market_range": None,
-                    "median_price": None,
-                    "mean_price": None,
-                    "client_price": client_price,
-                    "client_price_ok": None,
-                    "explanation": "Не удалось собрать предложения.",
-                },
-            }
-
-        # базовый отчёт
         report = analyze_market(item, offers, client_price)
-        analogs = collect_analogs(item, offers, use_ai=use_ai, analyzer=analyzer)
-        report["analogs_suggested"] = analogs
-
-        # валидация AI
-        if use_ai and analyzer and report.get("median_price"):
-            validation = analyzer.validate_report(report)
-            if not validation.get("is_valid"):
-                report["ai_flag"] = "SUSPICIOUS"
-                report["ai_comment"] = validation.get("comment")
-            else:
-                report["ai_flag"] = "OK"
-
-        # подробности по аналогам (упрощённо)
-        analog_details = []
-        for analog in analogs:
-            listings = fetch_listing_summaries(f"{analog} купить", top_n=3)
-            price_list = [l["price_guess"] for l in listings if l.get("price_guess")]
-            avg_price_math = int(sum(price_list) / len(price_list)) if price_list else None
-
-            pros, cons, note = [], [], ""
-            price_hint = None
-            best_link = None
-
-            if use_ai and analyzer:
-                ai_review = analyzer.review_analog(analog, listings) or {}
-                pros = ensure_list_str(ai_review.get("pros"))
-                cons = ensure_list_str(ai_review.get("cons"))
-                price_hint = ai_review.get("price_hint")
-                note = ai_review.get("note", "")
-                best_link = ai_review.get("best_link")
-
-            final_price = price_hint if price_hint else avg_price_math
-
-            analog_details.append(
-                {
-                    "name": analog,
-                    "listings": listings,
-                    "avg_price_guess": final_price,
-                    "ai_price_hint": price_hint,
-                    "pros": pros,
-                    "cons": cons,
-                    "note": note,
-                    "best_link": best_link,
-                }
-            )
-
-        report["analogs_details"] = analog_details
-
         return {
             "item": item,
             "offers_used": [asdict(o) for o in offers],
-            "analogs_suggested": analogs,
-            "analogs_details": analog_details,
+            "analogs_suggested": collect_analogs(item, offers, use_ai, analyzer),
+            "analogs_details": [],        # если у тебя ниже не добавляется что‑то ещё
             "market_report": report,
         }
     finally:
         fetcher.close()
+
 
 
 if __name__ == "__main__":
