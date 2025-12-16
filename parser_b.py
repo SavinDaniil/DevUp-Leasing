@@ -28,8 +28,12 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 
 from dotenv import load_dotenv
+import logging
 
 load_dotenv()
+
+# Настройте logger (можно добавить после load_dotenv())
+logger = logging.getLogger(__name__)
 
 # Ensure stdout handles UTF-8 on Windows to avoid mojibake in console.
 if sys.platform == "win32":
@@ -90,6 +94,9 @@ def digits_to_int(text: str) -> Optional[int]:
     digits = re.sub(r"[^\d]", "", text or "")
     if not digits:
         return None
+    # Avoid parsing phone numbers or long concatenations as integers
+    if len(digits) > 16:
+        return None
     try:
         return int(digits)
     except ValueError:
@@ -114,6 +121,7 @@ def extract_price_candidate(text: str) -> Optional[int]:
     """
     Smarter extraction: looks for numbers followed by currency markers (₽, руб, rub, $, €).
     If no currency, looks for large numbers (>10000) that aren't years (19xx, 20xx).
+    Filters out unlikely values (too small or too huge).
     """
     if not text:
         return None
@@ -123,7 +131,8 @@ def extract_price_candidate(text: str) -> Optional[int]:
     matches = re.findall(cur_pattern, text, flags=re.IGNORECASE)
     for m in matches:
         val = digits_to_int(m[0])
-        if val and val > 100: # filter out garbage
+        # Reasonable bounds: > 1000 RUB, < 100 billion
+        if val and 1000 < val < 100_000_000_000:
             return val
             
     # Fallback: look for generic big numbers, avoiding years
@@ -137,7 +146,8 @@ def extract_price_candidate(text: str) -> Optional[int]:
         if 1900 <= val <= 2030:
             continue
         # Assume valid price is likely > 10000 (context dependent, but safe for machinery/cars)
-        if val > 10000:
+        # and < 100 billion
+        if 10000 < val < 100_000_000_000:
             return val
     return None
 
@@ -159,25 +169,61 @@ def is_relevant_avito_title(title: str, model_name: str) -> bool:
     return all(k in title_l for k in keywords)
 
 
-def safe_json_loads(content: str) -> Optional[dict]:
+def safe_json_loads(content: str) -> Optional[Any]:
     """
     Robust JSON loader for LLM output.
     - strips code fences
-    - finds first {...} block
+    - finds first {...} or [...] block
     - returns None on failure
     """
     if not content:
         return None
     cleaned = content.replace("```json", "").replace("```", "").strip()
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
+    
+    # Try direct parse first
+    try:
+        return json.loads(cleaned)
+    except:
+        pass
+
+    # Find potential JSON start/end
+    start_brace = cleaned.find("{")
+    start_bracket = cleaned.find("[")
+    
+    # Determine which structure comes first
+    if start_brace != -1 and (start_bracket == -1 or start_brace < start_bracket):
+        start = start_brace
+        end = cleaned.rfind("}")
+    elif start_bracket != -1 and (start_brace == -1 or start_bracket < start_brace):
+        start = start_bracket
+        end = cleaned.rfind("]")
+    else:
+        return None
+
     if start == -1 or end == -1 or end <= start:
         return None
+        
     candidate = cleaned[start : end + 1]
     try:
         return json.loads(candidate)
     except Exception:
         return None
+
+
+def is_specialized_equipment(query: str) -> bool:
+    """
+    Checks if the query describes specialized/industrial equipment
+    that requires specific search strategies.
+    """
+    specialized_keywords = [
+        "буровая", "буровое", "буровой", "бурильная",
+        "экскаватор", "крановое", "подъемное",
+        "промышленное", "производственное", "технологическое",
+        "компрессор", "генератор", "насосное",
+        "сварочное", "обрабатывающее", "станок"
+    ]
+    query_lower = query.lower()
+    return any(keyword in query_lower for keyword in specialized_keywords)
 
 
 # =============================
@@ -315,41 +361,111 @@ class SeleniumFetcher:
         self.chrome_options.add_argument("--log-level=3")
         self.chrome_options.add_argument("--disable-logging")
         self.chrome_options.add_argument("--disable-dev-shm-usage")
+        # Убираем предупреждение о WebGL fallback
+        self.chrome_options.add_argument("--disable-webgl")
+        self.chrome_options.add_argument("--disable-software-rasterizer")
+        # Альтернативный вариант (как предлагает само сообщение):
+        # self.chrome_options.add_argument("--enable-unsafe-swiftshader")
         self.chrome_options.add_experimental_option("excludeSwitches", ["enable-logging"])
+        # Подавляем вывод DevTools и других предупреждений
+        self.chrome_options.add_experimental_option('excludeSwitches', ['enable-logging', 'enable-automation'])
+        self.chrome_options.add_experimental_option('useAutomationExtension', False)
         self.chrome_options.add_argument(
             "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
         )
+        # Устанавливаем таймауты
+        self.page_load_timeout = 30
+        self.implicit_wait = 10
+
+    def _is_driver_alive(self) -> bool:
+        """Проверяет, жив ли драйвер и может ли выполнять команды."""
+        if not self.driver:
+            return False
+        try:
+            # Пробуем выполнить простую команду
+            self.driver.current_url
+            return True
+        except Exception:
+            return False
 
     def _get_driver(self) -> webdriver.Chrome:
-        if self.driver:
+        """Получает рабочий драйвер, пересоздавая при необходимости."""
+        if self._is_driver_alive():
             return self.driver
+        
+        # Если драйвер мертв, закрываем его и создаем новый
+        if self.driver:
+            try:
+                self.driver.quit()
+            except Exception:
+                pass
+            self.driver = None
+        
+        # Создаем новый драйвер
         self.driver = webdriver.Chrome(options=self.chrome_options)
+        self.driver.set_page_load_timeout(self.page_load_timeout)
+        self.driver.implicitly_wait(self.implicit_wait)
         return self.driver
 
     def close(self):
         if self.driver:
             try:
                 self.driver.quit()
+            except Exception:
+                pass
             finally:
                 self.driver = None
 
-    def fetch_page(self, url: str, scroll_times: int = 2, wait: float = 1.5) -> Optional[str]:
-        driver = self._get_driver()
-        try:
-            driver.get(url)
-            last_height = driver.execute_script("return document.body.scrollHeight")
-            for _ in range(max(0, scroll_times)):
-                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(wait)
-                new_height = driver.execute_script("return document.body.scrollHeight")
-                if new_height == last_height:
-                    break
-                last_height = new_height
-            return driver.page_source
-        except Exception as e:
-            print(f"[!] Не удалось загрузить {url}: {e}")
-            return None
+    def fetch_page(self, url: str, scroll_times: int = 2, wait: float = 1.5, max_retries: int = 2) -> Optional[str]:
+        """
+        Загружает страницу с retry логикой.
+        
+        Args:
+            url: URL для загрузки
+            scroll_times: Количество прокруток
+            wait: Время ожидания между прокрутками
+            max_retries: Максимальное количество попыток при ошибке соединения
+        """
+        for attempt in range(max_retries + 1):
+            driver = None
+            try:
+                driver = self._get_driver()
+                driver.get(url)
+                last_height = driver.execute_script("return document.body.scrollHeight")
+                for _ in range(max(0, scroll_times)):
+                    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                    time.sleep(wait)
+                    new_height = driver.execute_script("return document.body.scrollHeight")
+                    if new_height == last_height:
+                        break
+                    last_height = new_height
+                return driver.page_source
+            except Exception as e:
+                error_msg = str(e)
+                # Проверяем, является ли это ошибкой соединения
+                is_connection_error = any(keyword in error_msg.lower() for keyword in [
+                    "connection", "подключение", "refused", "отверг", "10061",
+                    "session", "chrome", "webdriver"
+                ])
+                
+                if is_connection_error and attempt < max_retries:
+                    # При ошибке соединения пересоздаем драйвер
+                    logger.warning(f"[!] Ошибка соединения с драйвером (попытка {attempt + 1}/{max_retries + 1}): {error_msg[:100]}")
+                    if self.driver:
+                        try:
+                            self.driver.quit()
+                        except Exception:
+                            pass
+                        self.driver = None
+                    # Небольшая задержка перед повторной попыткой
+                    time.sleep(2)
+                    continue
+                else:
+                    logger.error(f"[!] Не удалось загрузить {url}: {error_msg}")
+                    return None
+        
+        return None
 
 
 # =============================
@@ -390,9 +506,11 @@ class LeasingAssetAnalyzer:
         if not html_content:
             return ""
         soup = BeautifulSoup(html_content, "html.parser")
-        for tag in soup(["script", "style", "nav", "footer", "header", "iframe", "noscript"]):
+        for tag in soup(["script", "style", "nav", "footer", "header", "iframe", "noscript", "aside", "form", "button"]):
             tag.decompose()
-        return soup.get_text(separator=" ", strip=True)[:10000]
+        text = soup.get_text(separator=" ", strip=True)
+        # Уменьшаем лимит с 10000 до 5000 символов
+        return text[:5000]
 
     def analyze_with_ai(self, text_content: str) -> Optional[dict]:
         if not text_content:
@@ -588,6 +706,81 @@ class LeasingAssetAnalyzer:
             print(f"[!] Validation warning: {e}")
             return {"is_valid": True}
 
+    def rank_offers_by_relevance(self, item_name: str, offers: list[LeasingOffer]) -> list[tuple[LeasingOffer, float]]:
+        """
+        Оценивает релевантность оферт относительно запроса через GigaChat.
+        Возвращает список кортежей (offer, relevance_score), отсортированных по убыванию релевантности.
+        """
+        if not offers:
+            return []
+        
+        token = self._get_gigachat_token()
+        if not token:
+            # Если нет токена, возвращаем оферты без сортировки с нейтральным score
+            return [(offer, 0.5) for offer in offers]
+        
+        # Формируем промпт для оценки релевантности
+        offers_text = "\n".join([
+            f"{i+1}. {offer.title} | {offer.source} | {offer.price_str or 'Цена не указана'} | {offer.url}"
+            for i, offer in enumerate(offers)
+        ])
+        
+        system_prompt = """Ты — эксперт по оценке релевантности объявлений о лизинге.
+Твоя задача — оценить, насколько каждое объявление соответствует запросу пользователя.
+Оцени релевантность каждого объявления по шкале от 0.0 до 1.0, где:
+- 1.0 — идеальное соответствие (точная модель, год, характеристики)
+- 0.8-0.9 — очень хорошее соответствие (та же модель, близкий год)
+- 0.6-0.7 — хорошее соответствие (аналог или похожая модель)
+- 0.4-0.5 — среднее соответствие (похожая категория)
+- 0.0-0.3 — низкое соответствие (другая категория или нерелевантно)
+
+Верни только JSON массив чисел (scores) в том же порядке, что и объявления.
+Пример: [0.95, 0.87, 0.72, 0.65, 0.45]"""
+        
+        user_prompt = f"""Запрос пользователя: {item_name}
+
+Объявления для оценки:
+{offers_text}
+
+Верни массив оценок релевантности (от 0.0 до 1.0) для каждого объявления в том же порядке."""
+        
+        url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
+        headers = {
+            "Content-Type": "application/json; charset=utf-8",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+        }
+        
+        payload = {
+            "model": "GigaChat-2",
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.1,
+            "max_tokens": 500,
+        }
+        
+        try:
+            resp = requests.post(url, headers=headers, json=payload, verify=False, timeout=30)
+            resp.raise_for_status()
+            result = resp.json()
+            content = result["choices"][0]["message"]["content"]
+            
+            # Парсим JSON из ответа
+            scores = safe_json_loads(content)
+            
+            # Убеждаемся, что количество scores совпадает с количеством оферт
+            if isinstance(scores, list) and len(scores) == len(offers):
+                # Нормализуем scores в диапазон [0, 1]
+                scores = [max(0.0, min(1.0, float(s))) for s in scores]
+                return list(zip(offers, scores))
+            else:
+                logger.warning(f"[!] GigaChat вернул неверное количество оценок: {len(scores) if isinstance(scores, list) else 0} вместо {len(offers)}")
+                return [(offer, 0.5) for offer in offers]
+        except Exception as e:
+            logger.error(f"[!] Ошибка при оценке релевантности через GigaChat: {e}")
+            return [(offer, 0.5) for offer in offers]
 
 
 # =============================
@@ -605,9 +798,9 @@ def parse_page_basic(html_content: str, model_name: str) -> dict:
     if re.search(r"цена\s+по\s+запросу|по\s+договоренности", text, flags=re.IGNORECASE):
         result["price_on_request"] = True
 
-    price = digits_to_int(text)
-    if price:
-        result["price"] = price
+    display_price = extract_price_candidate(text)
+    if display_price:
+        result["price"] = display_price
 
     year = _extract_year_from_text(text)
     if year:
@@ -631,24 +824,61 @@ def parse_page_basic(html_content: str, model_name: str) -> dict:
 # =============================
 # Search and URL handling
 # =============================
-def search_google(query: str, num_results: int = 10) -> list[dict]:
+def search_google(query: str, num_results: int = 10, specialized: bool = False) -> list[dict]:
+    """
+    Поиск через Google с поддержкой специализированных запросов.
+    
+    Args:
+        query: Поисковый запрос
+        num_results: Количество результатов
+        specialized: Если True, использует более специфичные запросы для промышленного оборудования
+    """
     if not SERPER_API_KEY:
         print("[!] SERPER_API_KEY не задан.")
         return []
+    
+    # Для специализированного оборудования добавляем специфичные термины
+    if specialized:
+        if is_specialized_equipment(query):
+            # Добавляем специфичные термины для лучшего поиска
+            query = f"{query} лизинг промышленного оборудования OR аренда OR продажа"
+    
     try:
         resp = requests.post(
             "https://google.serper.dev/search",
             headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
-            json={"q": query, "gl": "ru", "hl": "ru", "num": num_results},
+            json={
+                "q": query, 
+                "gl": "ru", 
+                "hl": "ru", 
+                "num": num_results,
+                # Исключаем популярные сайты, если ищем специализированное оборудование
+                "excludeDomains": "avito.ru,drom.ru,auto.ru" if specialized else None,
+            },
             timeout=15,
         )
         resp.raise_for_status()
-        return resp.json().get("organic", [])
+        results = resp.json().get("organic", [])
+        
+        # Приоритизируем специализированные домены
+        if specialized:
+            specialized_domains = [
+                "promleasing", "techleasing", "equipment", "leasing",
+                "пром", "тех", "оборудование", "лизинг"
+            ]
+            # Сортируем: сначала специализированные
+            results.sort(key=lambda x: any(
+                domain in urlparse(x.get("link", "")).netloc.lower() 
+                for domain in specialized_domains
+            ), reverse=True)
+        
+        return results
     except Exception as exc:
         print(f"[!] Ошибка поиска: {exc}")
         return []
 
 
+# Расширенный список источников для специализированного оборудования
 MANDATORY_SOURCES = [
     {
         "name": "alfaleasing.ru",
@@ -664,35 +894,100 @@ MANDATORY_SOURCES = [
     },
 ]
 
+# Специализированные источники для промышленного оборудования
+SPECIALIZED_SOURCES = [
+    {
+        "name": "promleasing.ru",
+        "search_url": "https://promleasing.ru/search?q={query}",
+        "categories": ["промышленное", "буровое", "строительное"]
+    },
+    {
+        "name": "techleasing.ru",
+        "search_url": "https://techleasing.ru/catalog?search={query}",
+        "categories": ["техника", "оборудование"]
+    },
+    {
+        "name": "equipment-leasing.ru",
+        "search_url": "https://equipment-leasing.ru/search/{query}",
+        "categories": ["оборудование", "техника"]
+    },
+    # Добавьте другие специализированные сайты
+]
 
-def generate_mandatory_urls(model_name: str) -> list[dict]:
+def generate_mandatory_urls(model_name: str, include_specialized: bool = True) -> list[dict]:
     query_encoded = model_name.replace(" ", "+").lower()
     mandatory = []
+    
+    # Обычные источники
     for source in MANDATORY_SOURCES:
         url = source["search_url"].format(query=query_encoded)
-        mandatory.append(
-            {
+        mandatory.append({
+            "link": url,
+            "title": f"{model_name} - {source['name']}",
+            "is_mandatory": True,
+            "source_name": source["name"],
+        })
+    
+    # Специализированные источники (если включены)
+    if include_specialized:
+        for source in SPECIALIZED_SOURCES:
+            url = source["search_url"].format(query=query_encoded)
+            mandatory.append({
                 "link": url,
                 "title": f"{model_name} - {source['name']}",
                 "is_mandatory": True,
                 "source_name": source["name"],
-            }
-        )
+                "is_specialized": True,
+            })
+    
     return mandatory
 
 
-def filter_search_results(results: list[dict], max_results: int = 10) -> list[dict]:
+def filter_search_results(results: list[dict], max_results: int = 10, specialized: bool = False) -> list[dict]:
+    """
+    Фильтрует результаты поиска с приоритетом специализированных сайтов.
+    """
     filtered = []
     blocked_domains = {"chelindleasing"}
+    
+    # Домены специализированных сайтов (высокий приоритет)
+    specialized_domains = {
+        "promleasing", "techleasing", "equipment-leasing", 
+        "промлизинг", "техлизинг", "оборудование",
+        "alfaleasing", "sberleasing"
+    }
+    
+    # Популярные сайты (низкий приоритет для специализированного оборудования)
+    popular_domains = {"avito", "drom", "auto.ru", "youla"}
+    
+    # Разделяем на категории
+    specialized_results = []
+    regular_results = []
+    popular_results = []
+    
     for result in results:
-        if len(filtered) >= max_results:
+        if len(filtered) >= max_results * 2:  # Собираем больше для сортировки
             break
         url = result.get("link", "")
-        domain = urlparse(url).netloc.replace("www.", "")
+        domain = urlparse(url).netloc.replace("www.", "").lower()
+        
         if any(blocked in domain for blocked in blocked_domains):
             continue
-        filtered.append(result)
-    return filtered
+        
+        if specialized and any(spec_domain in domain for spec_domain in specialized_domains):
+            specialized_results.append(result)
+        elif specialized and any(pop_domain in domain for pop_domain in popular_domains):
+            popular_results.append(result)  # Низкий приоритет
+        else:
+            regular_results.append(result)
+    
+    # Объединяем: сначала специализированные, потом обычные, потом популярные
+    if specialized:
+        filtered = specialized_results + regular_results + popular_results
+    else:
+        filtered = regular_results + specialized_results + popular_results
+    
+    return filtered[:max_results]
 
 
 def merge_with_mandatory(search_results: list[dict], mandatory: list[dict]) -> list[dict]:
@@ -783,6 +1078,10 @@ def fetch_listing_summaries(query: str, top_n: int = 3) -> list[dict]:
 
 def analyze_market(item_name: str, offers: list[LeasingOffer], client_price: Optional[int]) -> dict:
     prices = [o.price for o in offers if o.price is not None]
+    # Подсчитываем оферты с ценой по запросу
+    offers_with_price_on_request = [o for o in offers if o.price_on_request and o.price is None]
+    offers_with_price = [o for o in offers if o.price is not None]
+    
     result = {
         "item": item_name,
         "offers_used": [asdict(o) for o in offers],
@@ -793,33 +1092,72 @@ def analyze_market(item_name: str, offers: list[LeasingOffer], client_price: Opt
         "client_price": client_price,
         "client_price_ok": None,
         "explanation": "",
+        "offers_with_price_count": len(offers_with_price),
+        "offers_price_on_request_count": len(offers_with_price_on_request),
     }
+    
+    # Если есть оферты с ценой по запросу, но нет цен - сообщаем об этом
+    if not prices and offers_with_price_on_request:
+        result["explanation"] = (
+            f"Найдено {len(offers)} объявлений, из них {len(offers_with_price_on_request)} с ценой по запросу. "
+            f"Для расчета рыночной стоимости недостаточно данных о ценах."
+        )
+        return result
+    
     if not prices:
         result["explanation"] = "Нет собранных цен."
         return result
 
     prices_sorted = sorted(prices)
     min_p, max_p = prices_sorted[0], prices_sorted[-1]
-    median_p = statistics.median(prices_sorted)
-    mean_p = round(statistics.mean(prices_sorted))
+    
+    # Преобразуем цены в float перед вычислением статистики, чтобы избежать переполнения
+    try:
+        prices_float = [float(p) for p in prices_sorted]
+        median_p = statistics.median(prices_float)
+        mean_p = statistics.mean(prices_float)
+        # Округляем mean_p до int для консистентности
+        mean_p = round(mean_p)
+    except (OverflowError, ValueError) as e:
+        # Если произошло переполнение, используем альтернативный метод
+        logger.warning(f"[!] Ошибка при вычислении статистики: {e}, используем упрощенный расчет")
+        # Для медианы берем средний элемент
+        n = len(prices_sorted)
+        if n % 2 == 0:
+            median_p = (prices_sorted[n//2 - 1] + prices_sorted[n//2]) / 2.0
+        else:
+            median_p = float(prices_sorted[n//2])
+        # Для среднего используем деление с float
+        mean_p = round(sum(prices_sorted) / float(len(prices_sorted)))
 
     result["market_range"] = [min_p, max_p]
-    result["median_price"] = median_p
-    result["mean_price"] = mean_p
+    result["median_price"] = float(median_p) if median_p is not None else None
+    result["mean_price"] = float(mean_p) if mean_p is not None else None
+
+    # Формируем explanation с учетом оферт с ценой по запросу
+    price_info = f"Рыночный диапазон {format_price(min_p)} – {format_price(max_p)}, медиана {format_price(int(median_p))}."
+    if offers_with_price_on_request:
+        price_info += f" Также найдено {len(offers_with_price_on_request)} объявлений с ценой по запросу."
 
     if client_price is not None:
-        deviation = (client_price - median_p) / median_p * 100
-        ok = abs(deviation) <= 20  # 20% tolerance
-        result["client_price_ok"] = ok
-        verdict = "подтверждена" if ok else "не подтверждена"
-        result["explanation"] = (
-            f"Рыночный диапазон {format_price(min_p)} – {format_price(max_p)}, медиана {format_price(median_p)}. "
-            f"Цена клиента {format_price(client_price)} ({deviation:+.1f}%), {verdict}."
-        )
+        try:
+            deviation = (client_price - median_p) / median_p * 100
+            ok = abs(deviation) <= 20  # 20% tolerance
+            result["client_price_ok"] = ok
+            verdict = "подтверждена" if ok else "не подтверждена"
+            result["explanation"] = (
+                f"{price_info} "
+                f"Цена клиента {format_price(client_price)} ({deviation:+.1f}%), {verdict}."
+            )
+        except (OverflowError, ZeroDivisionError) as e:
+            logger.warning(f"[!] Ошибка при вычислении отклонения: {e}")
+            result["client_price_ok"] = None
+            result["explanation"] = (
+                f"{price_info} "
+                f"Цена клиента {format_price(client_price)}."
+            )
     else:
-        result["explanation"] = (
-            f"Рыночный диапазон {format_price(min_p)} – {format_price(max_p)}, медиана {format_price(median_p)}."
-        )
+        result["explanation"] = price_info
 
     return result
 
@@ -829,7 +1167,8 @@ def analyze_market(item_name: str, offers: list[LeasingOffer], client_price: Opt
 # =============================
 def extract_model_from_query(query: str) -> str:
     parts = query.split()
-    return " ".join(parts[:2]) if parts else ""
+    index = parts.index('купить')
+    return " ".join(parts[:index]) if parts else ""
 
 
 def search_and_analyze(
@@ -838,17 +1177,21 @@ def search_and_analyze(
     analyzer: Optional[LeasingAssetAnalyzer],
     num_results: int = 5,
     use_ai: bool = True,
+    specialized: bool = False,  # Новый параметр
 ) -> list[LeasingOffer]:
     print("\n" + "=" * 70)
     print(f"Поисковый запрос: {query}")
+    if specialized:
+        print("[*] Режим поиска специализированного оборудования")
     print("=" * 70)
 
     model_name = extract_model_from_query(query)
-    mandatory_urls = generate_mandatory_urls(model_name)
+    mandatory_urls = generate_mandatory_urls(model_name, include_specialized=specialized)
     print(f"[*] Обязательные источники: {len(mandatory_urls)}")
 
-    search_results = search_google(query, num_results * 2)
-    filtered_google = filter_search_results(search_results, num_results) if search_results else []
+    # Используем улучшенный поиск
+    search_results = search_google(query, num_results * 2, specialized=specialized)  # Больше результатов для фильтрации
+    filtered_google = filter_search_results(search_results, num_results * 2, specialized=specialized) if search_results else []
 
     all_results = merge_with_mandatory(filtered_google, mandatory_urls)
     print(f"[*] Всего URL: {len(all_results)}")
