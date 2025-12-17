@@ -1,7 +1,7 @@
 """
 Leasing asset market analyzer (CLI).
 
-Key improvements for Sber use‑case:
+Key features:
 - Dedicated Avito list-page parser (HTML only, no LLM).
 - Reusable Selenium driver with configurable scroll depth.
 - Safe JSON parsing of LLM output.
@@ -11,24 +11,45 @@ Key improvements for Sber use‑case:
 
 import io
 import json
+import logging
 import os
 import re
 import statistics
 import sys
 import time
 import uuid
+from abc import ABC, abstractmethod
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 from dataclasses import asdict, dataclass, field
-from typing import Optional
+from functools import lru_cache
+from typing import Optional, TypedDict
 from urllib.parse import urljoin, urlparse
 
 import requests
 import urllib3
 from bs4 import BeautifulSoup
 from selenium import webdriver
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tqdm import tqdm
 
 from dotenv import load_dotenv
-load_dotenv
+
+load_dotenv()
+
+# =============================
+# Logging configuration
+# =============================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 # Ensure stdout handles UTF-8 on Windows to avoid mojibake in console.
 if sys.platform == "win32":
@@ -36,8 +57,554 @@ if sys.platform == "win32":
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-SERPER_API_KEY = os.getenv("SERPER_API_KEY")
-GIGACHAT_AUTH_DATA = os.getenv("GIGACHAT_AUTH_DATA")
+# Configure requests connection pool
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# Create session with larger connection pool
+_requests_session = requests.Session()
+retry_strategy = Retry(
+    total=3,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["POST", "GET"]
+)
+adapter = HTTPAdapter(
+    pool_connections=10,
+    pool_maxsize=20,
+    max_retries=retry_strategy
+)
+_requests_session.mount("http://", adapter)
+_requests_session.mount("https://", adapter)
+
+
+# =============================
+# Configuration
+# =============================
+@dataclass(frozen=True)
+class Config:
+    """Application configuration with sensible defaults."""
+    
+    # API Keys (loaded from environment)
+    serper_api_key: Optional[str] = field(default_factory=lambda: os.getenv("SERPER_API_KEY"))
+    gigachat_auth_data: Optional[str] = field(default_factory=lambda: os.getenv("GIGACHAT_AUTH_DATA"))
+    
+    # HTTP settings
+    http_timeout: int = 20
+    http_long_timeout: int = 40
+    
+    # Selenium settings
+    scroll_wait: float = 1.5
+    default_scroll_times: int = 2
+    avito_scroll_times: int = 2
+    other_scroll_times: int = 3
+    
+    # Content processing
+    max_content_length: int = 10000
+    
+    # Market analysis
+    price_deviation_tolerance: float = 0.20
+    min_valid_price: int = 100
+    min_large_price: int = 10000
+    outlier_min_samples: int = 5
+    iqr_multiplier: float = 1.5
+    
+    # GigaChat settings
+    gigachat_model: str = "GigaChat-2"
+    gigachat_oauth_url: str = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+    gigachat_api_url: str = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
+    
+    # Search settings
+    default_num_results: int = 5
+    max_analogs: int = 5
+    min_analogs_before_ai: int = 3
+    
+    # Domain settings
+    avito_domain: str = "avito.ru"
+    default_search_suffix: str = "лизинг"
+    fallback_search_suffix: str = "купить"
+    
+    # Selenium timeout settings
+    page_load_timeout: int = 45  # Increased for slow pages
+    implicit_wait: int = 10
+    script_timeout: int = 30  # Timeout for JavaScript execution
+    
+    # Parallel processing
+    max_workers: int = 3
+    
+    # Rate limiting (more conservative to avoid 429 errors)
+    google_rate_limit_calls: int = 10
+    google_rate_limit_period: float = 60.0
+    gigachat_rate_limit_calls: int = 15  # Reduced from 20
+    gigachat_rate_limit_period: float = 60.0
+    gigachat_min_delay: float = 0.5  # Minimum delay between requests (seconds)
+    
+    # Currency exchange rates (to RUB)
+    exchange_rates: dict[str, float] = field(default_factory=lambda: {
+        "USD": 100.0,
+        "EUR": 110.0,
+        "RUB": 1.0,
+    })
+
+
+# Global config instance
+CONFIG = Config()
+
+
+# =============================
+# Rate Limiting
+# =============================
+class RateLimiter:
+    """Thread-safe rate limiter to prevent API throttling."""
+    
+    def __init__(self, max_calls: int, period: float, min_delay: float = 0.0):
+        self.calls = deque()
+        self.max_calls = max_calls
+        self.period = period
+        self.min_delay = min_delay
+        self.last_call_time = 0.0
+        self._lock = Lock()  # Thread safety
+    
+    def wait_if_needed(self):
+        """Wait if rate limit would be exceeded (thread-safe)."""
+        with self._lock:
+            now = time.time()
+            
+            # Enforce minimum delay between requests
+            if self.min_delay > 0 and self.last_call_time > 0:
+                time_since_last = now - self.last_call_time
+                if time_since_last < self.min_delay:
+                    sleep_time = self.min_delay - time_since_last
+                    logger.debug(f"Min delay: waiting {sleep_time:.2f}s")
+                    time.sleep(sleep_time)
+                    now = time.time()
+            
+            # Remove old calls outside the period
+            while self.calls and self.calls[0] < now - self.period:
+                self.calls.popleft()
+            
+            # If at limit, wait until oldest call expires
+            if len(self.calls) >= self.max_calls:
+                sleep_time = self.period - (now - self.calls[0])
+                if sleep_time > 0:
+                    logger.debug(f"Rate limit: waiting {sleep_time:.1f}s")
+                    time.sleep(sleep_time)
+                    now = time.time()
+                    # Re-check after sleep
+                    while self.calls and self.calls[0] < now - self.period:
+                        self.calls.popleft()
+            
+            self.calls.append(now)
+            self.last_call_time = now
+
+
+# Global rate limiters
+google_rate_limiter = RateLimiter(CONFIG.google_rate_limit_calls, CONFIG.google_rate_limit_period)
+gigachat_rate_limiter = RateLimiter(
+    CONFIG.gigachat_rate_limit_calls, 
+    CONFIG.gigachat_rate_limit_period,
+    min_delay=CONFIG.gigachat_min_delay
+)
+
+
+# =============================
+# URL Validation
+# =============================
+def is_valid_url(url: str) -> bool:
+    """Validate URL format."""
+    if not url or not isinstance(url, str):
+        return False
+    try:
+        result = urlparse(url)
+        return all([result.scheme, result.netloc])
+    except Exception:
+        return False
+
+
+# =============================
+# Currency Normalization
+# =============================
+def normalize_price(price: Optional[int], currency: Optional[str]) -> Optional[int]:
+    """Convert price to RUB using exchange rates."""
+    if price is None:
+        return None
+    
+    if not currency or currency.upper() == "RUB":
+        return price
+    
+    rate = CONFIG.exchange_rates.get(currency.upper())
+    if rate is None:
+        logger.warning(f"Unknown currency: {currency}, assuming RUB")
+        return price
+    
+    return int(price * rate)
+
+
+# =============================
+# Parser Abstraction (Strategy Pattern)
+# =============================
+class ParserStrategy(ABC):
+    """Abstract base class for parsing strategies."""
+    
+    @abstractmethod
+    def parse(self, html: str, url: str, model_name: str, title: str = "") -> list["LeasingOffer"]:
+        """Parse HTML and return list of offers."""
+        pass
+
+
+class AvitoParserStrategy(ParserStrategy):
+    """Parser for Avito listing pages."""
+    
+    def parse(self, html: str, url: str, model_name: str, title: str = "") -> list["LeasingOffer"]:
+        """Parse Avito list page."""
+        return parse_avito_list_page(html, model_name)
+
+
+# =============================
+# Offer Creation Helper
+# =============================
+def validate_offer_data(title: str, url: str, merged: dict) -> tuple[bool, str]:
+    """Validate offer data quality. Returns (is_valid, reason)."""
+    if not title or len(title.strip()) < 3:
+        return False, "Title too short"
+    
+    if not url or not is_valid_url(url):
+        return False, "Invalid URL"
+    
+    # Check if we have at least some meaningful data
+    has_price = merged.get("price") is not None
+    has_monthly = merged.get("monthly_payment") is not None
+    has_price_request = merged.get("price_on_request", False)
+    
+    if not (has_price or has_monthly or has_price_request):
+        # Allow offers without price if they have other useful data
+        has_other_data = any([
+            merged.get("year"),
+            merged.get("vendor"),
+            merged.get("model"),
+            merged.get("specs"),
+        ])
+        if not has_other_data:
+            return False, "No meaningful data"
+    
+    # Validate price if present
+    price = merged.get("price")
+    if price is not None:
+        if price < 0:
+            return False, "Negative price"
+        if price > 10**12:  # Unrealistically large price
+            return False, "Price too large"
+    
+    return True, "OK"
+
+
+def normalize_model_name(model_name: str) -> str:
+    """Normalize model name (capitalize, remove extra spaces)."""
+    if not model_name:
+        return ""
+    # Capitalize first letter of each word
+    words = model_name.split()
+    normalized = " ".join(word.capitalize() if word else "" for word in words)
+    return normalized.strip()
+
+
+def normalize_vendor_name(vendor: Optional[str]) -> Optional[str]:
+    """Normalize vendor name (capitalize, common abbreviations)."""
+    if not vendor:
+        return None
+    
+    # Common vendor normalizations
+    vendor_map = {
+        "bmw": "BMW",
+        "mercedes": "Mercedes-Benz",
+        "mercedes-benz": "Mercedes-Benz",
+        "audi": "Audi",
+        "volvo": "Volvo",
+        "toyota": "Toyota",
+        "lexus": "Lexus",
+        "porsche": "Porsche",
+        "bentley": "Bentley",
+        "ferrari": "Ferrari",
+        "apple": "Apple",
+        "iphone": "Apple",
+        "samsung": "Samsung",
+        "huawei": "Huawei",
+        "google": "Google",
+    }
+    
+    vendor_lower = vendor.lower().strip()
+    if vendor_lower in vendor_map:
+        return vendor_map[vendor_lower]
+    
+    # Capitalize first letter
+    return vendor.capitalize()
+
+
+def enrich_offer_data(merged: dict, title: str, text: str = "") -> dict:
+    """Enrich offer data with additional extracted information."""
+    enriched = dict(merged)
+    
+    # Extract phone number if not present
+    if "phone" not in enriched and text:
+        phone_match = re.search(r'[\+]?[7-8]?[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}', text)
+        if phone_match:
+            enriched["phone"] = phone_match.group(0)
+    
+    # Extract email if not present
+    if "email" not in enriched and text:
+        email_match = re.search(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', text)
+        if email_match:
+            enriched["email"] = email_match.group(0)
+    
+    # Normalize vendor
+    if enriched.get("vendor"):
+        enriched["vendor"] = normalize_vendor_name(enriched["vendor"])
+    
+    # Normalize model if present
+    if enriched.get("model"):
+        enriched["model"] = normalize_model_name(enriched["model"])
+    
+    # Extract condition from text if not present
+    if not enriched.get("condition") and text:
+        condition_patterns = {
+            "новый": "новый",
+            "новое": "новый",
+            "б/у": "б/у",
+            "б у": "б/у",
+            "бывший в употреблении": "б/у",
+            "used": "б/у",
+            "new": "новый",
+        }
+        text_lower = text.lower()
+        for pattern, condition in condition_patterns.items():
+            if pattern in text_lower:
+                enriched["condition"] = condition
+                break
+    
+    return enriched
+
+
+def create_offer_from_merged(
+    title: str,
+    url: str,
+    domain: str,
+    model_name: str,
+    merged: dict,
+    text: str = ""
+) -> Optional["LeasingOffer"]:
+    """Create LeasingOffer from merged parsing results with validation and enrichment."""
+    # Enrich data
+    enriched = enrich_offer_data(merged, title, text)
+    
+    # Validate data
+    is_valid, reason = validate_offer_data(title, url, enriched)
+    if not is_valid:
+        logger.debug(f"Skipping invalid offer: {reason} - {title[:50]}")
+        return None
+    
+    price = enriched.get("price")
+    currency = enriched.get("currency", "RUB")
+    
+    # Normalize price to RUB
+    normalized_price = normalize_price(price, currency)
+    
+    # Normalize model name
+    normalized_model = normalize_model_name(model_name) if model_name else ""
+    
+    # Normalize title (remove extra spaces)
+    normalized_title = normalize_whitespace(title)
+    
+    return LeasingOffer(
+        title=normalized_title,
+        url=url,
+        source=domain,
+        model=normalized_model,
+        price=normalized_price,
+        price_str=format_price(normalized_price),
+        monthly_payment=enriched.get("monthly_payment"),
+        monthly_payment_str=format_price(enriched.get("monthly_payment")),
+        price_on_request=enriched.get("price_on_request", False),
+        year=enriched.get("year"),
+        power=enriched.get("power"),
+        mileage=enriched.get("mileage"),
+        vendor=normalize_vendor_name(enriched.get("vendor")),
+        condition=enriched.get("condition"),
+        location=enriched.get("location"),
+        specs=enriched.get("specs", {}),
+        category=enriched.get("category"),
+        currency="RUB",  # Always RUB after normalization
+        pros=ensure_list_str(enriched.get("pros")),
+        cons=ensure_list_str(enriched.get("cons")),
+        analogs=ensure_list_str(enriched.get("analogs_mentioned")),
+    )
+
+
+# =============================
+# Offer Deduplication
+# =============================
+def normalize_offer_title(title: str) -> str:
+    """Normalize offer title for comparison (lowercase, remove extra spaces, special chars)."""
+    if not title:
+        return ""
+    # Convert to lowercase, remove extra spaces, remove special punctuation
+    normalized = re.sub(r'[^\w\s]', '', title.lower())
+    normalized = re.sub(r'\s+', ' ', normalized).strip()
+    return normalized
+
+
+def normalize_url_for_comparison(url: str) -> str:
+    """Normalize URL for duplicate detection."""
+    if not url:
+        return ""
+    try:
+        parsed = urlparse(url)
+        # Remove www, trailing slashes, fragments, query params for comparison
+        netloc = parsed.netloc.replace("www.", "").lower()
+        path = parsed.path.rstrip("/").lower()
+        return f"{parsed.scheme}://{netloc}{path}"
+    except Exception:
+        return url.lower()
+
+
+def are_offers_similar(offer1: "LeasingOffer", offer2: "LeasingOffer", similarity_threshold: float = 0.85) -> bool:
+    """Check if two offers are similar based on multiple criteria."""
+    # URL similarity (exact match after normalization)
+    url1 = normalize_url_for_comparison(offer1.url)
+    url2 = normalize_url_for_comparison(offer2.url)
+    if url1 == url2 and url1:
+        return True
+    
+    # Title similarity (fuzzy matching)
+    title1 = normalize_offer_title(offer1.title)
+    title2 = normalize_offer_title(offer2.title)
+    if title1 and title2:
+        # Simple similarity: check if one title contains most words of another
+        words1 = set(title1.split())
+        words2 = set(title2.split())
+        if len(words1) > 0 and len(words2) > 0:
+            intersection = words1 & words2
+            union = words1 | words2
+            similarity = len(intersection) / len(union) if union else 0
+            if similarity >= similarity_threshold:
+                # Also check price similarity
+                if offer1.price and offer2.price:
+                    price_diff = abs(offer1.price - offer2.price) / max(offer1.price, offer2.price)
+                    if price_diff < 0.05:  # Less than 5% price difference
+                        return True
+    
+    return False
+
+
+def deduplicate_offers(offers: list["LeasingOffer"]) -> list["LeasingOffer"]:
+    """Remove duplicate offers based on URL and content similarity."""
+    if not offers:
+        return []
+    
+    seen_urls = set()
+    unique_offers = []
+    duplicates_removed = 0
+    
+    for offer in offers:
+        # Skip invalid offers
+        if not offer.url or not offer.title:
+            logger.debug(f"Skipping offer with missing URL or title")
+            duplicates_removed += 1
+            continue
+        
+        # Normalize URL for comparison
+        normalized_url = normalize_url_for_comparison(offer.url)
+        
+        # Check for exact URL match
+        if normalized_url in seen_urls:
+            logger.debug(f"Skipping duplicate URL: {normalized_url}")
+            duplicates_removed += 1
+            continue
+        
+        # Check for similar offers (content-based deduplication)
+        is_duplicate = False
+        for existing_offer in unique_offers:
+            if are_offers_similar(offer, existing_offer):
+                logger.debug(f"Skipping similar offer: {offer.title[:50]}... (similar to {existing_offer.title[:50]}...)")
+                duplicates_removed += 1
+                is_duplicate = True
+                break
+        
+        if not is_duplicate:
+            seen_urls.add(normalized_url)
+            unique_offers.append(offer)
+    
+    if duplicates_removed > 0:
+        logger.info(f"Removed {duplicates_removed} duplicate/similar offers (kept {len(unique_offers)} unique)")
+    
+    return unique_offers
+
+
+# =============================
+# Type definitions
+# =============================
+class BasicParseResult(TypedDict, total=False):
+    """Result from basic HTML parsing."""
+    price_on_request: bool
+    price: int
+    year: int
+    power: str
+    mileage: str
+    vendor: str
+
+
+class AIAnalysisResult(TypedDict, total=False):
+    """Result from AI analysis."""
+    category: str
+    vendor: str
+    model: str
+    price: int
+    currency: str
+    monthly_payment: int
+    year: int
+    condition: str
+    location: str
+    specs: dict
+    pros: list[str]
+    cons: list[str]
+    analogs_mentioned: list[str]
+
+
+class AnalogReview(TypedDict, total=False):
+    """AI review of an analog model."""
+    pros: list[str]
+    cons: list[str]
+    price_hint: Optional[int]
+    note: str
+    best_link: Optional[str]
+
+
+class ValidationResult(TypedDict, total=False):
+    """Result of AI report validation."""
+    is_valid: bool
+    comment: str
+
+
+class SearchResult(TypedDict):
+    """Search result from Serper API."""
+    title: str
+    link: str
+    snippet: str
+
+
+class ListingSummary(TypedDict):
+    """Summary of a listing for analog comparison."""
+    title: str
+    link: str
+    snippet: str
+    price_guess: Optional[int]
+
+
+class UserInput(TypedDict):
+    """User input parameters."""
+    item: str
+    client_price: Optional[int]
+    use_ai: bool
+    num_results: int
 
 
 # =============================
@@ -45,12 +612,13 @@ GIGACHAT_AUTH_DATA = os.getenv("GIGACHAT_AUTH_DATA")
 # =============================
 @dataclass
 class LeasingOffer:
+    """Represents a single leasing offer."""
     title: str
     url: str
     source: str
     model: str = ""
-    price: Optional[int] = None  # numeric price
-    price_str: Optional[str] = None  # formatted price string
+    price: Optional[int] = None
+    price_str: Optional[str] = None
     monthly_payment: Optional[int] = None
     monthly_payment_str: Optional[str] = None
     price_on_request: bool = False
@@ -69,39 +637,43 @@ class LeasingOffer:
     analogs_suggested: list[str] = field(default_factory=list)
 
     def has_data(self) -> bool:
-        return any(
-            [
+        """Check if offer contains meaningful pricing data."""
+        return any([
                 self.price is not None,
                 self.monthly_payment is not None,
                 self.price_on_request,
-            ]
-        )
+        ])
 
 
 # =============================
 # Utility helpers
 # =============================
 def normalize_whitespace(text: str) -> str:
+    """Collapse multiple whitespace characters into single space."""
     return re.sub(r"\s+", " ", text).strip()
 
 
 def digits_to_int(text: str) -> Optional[int]:
+    """Extract integer from text, removing non-digit characters."""
     digits = re.sub(r"[^\d]", "", text or "")
     if not digits:
         return None
     try:
         return int(digits)
     except ValueError:
+        logger.debug(f"Failed to convert '{digits}' to int")
         return None
 
 
 def format_price(value: Optional[int]) -> Optional[str]:
+    """Format integer price as human-readable string with currency."""
     if value is None:
         return None
     return f"{value:,}".replace(",", " ") + " ₽"
 
 
 def ensure_list_str(value) -> list[str]:
+    """Ensure value is a list of non-empty strings."""
     if not value:
         return []
     if isinstance(value, list):
@@ -111,37 +683,39 @@ def ensure_list_str(value) -> list[str]:
 
 def extract_price_candidate(text: str) -> Optional[int]:
     """
-    Smarter extraction: looks for numbers followed by currency markers (₽, руб, rub, $, €).
-    If no currency, looks for large numbers (>10000) that aren't years (19xx, 20xx).
+    Smart extraction of price from text.
+    
+    Looks for numbers followed by currency markers (₽, руб, rub, $, €).
+    Falls back to large numbers that aren't years (19xx, 20xx).
     """
     if not text:
         return None
     
     # Try currency patterns first
-    cur_pattern = r"(\d[\d\s]*)\s*(₽|руб|rub|\$|€)"
-    matches = re.findall(cur_pattern, text, flags=re.IGNORECASE)
-    for m in matches:
-        val = digits_to_int(m[0])
-        if val and val > 100: # filter out garbage
+    currency_pattern = r"(\d[\d\s]*)\s*(₽|руб|rub|\$|€)"
+    matches = re.findall(currency_pattern, text, flags=re.IGNORECASE)
+    for match in matches:
+        val = digits_to_int(match[0])
+        if val and val > CONFIG.min_valid_price:
             return val
             
     # Fallback: look for generic big numbers, avoiding years
-    # 4-digit numbers starting with 19 or 20 are usually years
     nums = re.findall(r"\b\d[\d\s]*\b", text)
     for n in nums:
         val = digits_to_int(n)
         if not val: 
             continue
-        # Avoid likely years
+        # Avoid likely years (1900-2030)
         if 1900 <= val <= 2030:
             continue
-        # Assume valid price is likely > 10000 (context dependent, but safe for machinery/cars)
-        if val > 10000:
+        # Assume valid price is likely > 10000 for machinery/cars
+        if val > CONFIG.min_large_price:
             return val
     return None
 
 
 def normalize_url(url: str, base: str = "https://www.avito.ru") -> str:
+    """Normalize relative URL to absolute."""
     if not url:
         return url
     if url.startswith("http"):
@@ -153,17 +727,18 @@ def is_relevant_avito_title(title: str, model_name: str) -> bool:
     """Check if all model keywords are present in title."""
     if not model_name:
         return True
-    title_l = title.lower()
+    title_lower = title.lower()
     keywords = [w for w in re.split(r"\s+", model_name.lower()) if w]
-    return all(k in title_l for k in keywords)
+    return all(k in title_lower for k in keywords)
 
 
 def safe_json_loads(content: str) -> Optional[dict]:
     """
     Robust JSON loader for LLM output.
-    - strips code fences
-    - finds first {...} block
-    - returns None on failure
+    
+    - Strips code fences
+    - Finds first {...} block
+    - Returns None on failure
     """
     if not content:
         return None
@@ -172,45 +747,641 @@ def safe_json_loads(content: str) -> Optional[dict]:
     end = cleaned.rfind("}")
     if start == -1 or end == -1 or end <= start:
         return None
-    candidate = cleaned[start : end + 1]
+    candidate = cleaned[start:end + 1]
     try:
         return json.loads(candidate)
-    except Exception:
+    except json.JSONDecodeError as e:
+        logger.debug(f"JSON parse error: {e}")
         return None
 
 
 # =============================
-# Avito parsing
+# Text extraction helpers
 # =============================
 def _extract_year_from_text(text: str) -> Optional[int]:
-    m = re.search(r"(20[0-4]\d|19\d{2})", text)
-    if m:
+    """Extract year (1900-2049) from text."""
+    match = re.search(r"(20[0-4]\d|19\d{2})", text)
+    if match:
         try:
-            return int(m.group(1))
+            return int(match.group(1))
         except ValueError:
             return None
     return None
 
 
 def _extract_power(text: str) -> Optional[str]:
-    m = re.search(r"(\d{2,4})\s*(л\.?с\.?|hp)", text, flags=re.IGNORECASE)
-    return m.group(1) if m else None
+    """Extract engine power (hp/л.с.) from text."""
+    match = re.search(r"(\d{2,4})\s*(л\.?с\.?|hp)", text, flags=re.IGNORECASE)
+    return match.group(1) if match else None
 
 
 def _extract_mileage(text: str) -> Optional[str]:
-    m = re.search(r"(\d[\d\s]{2,6})\s*(км|km)", text, flags=re.IGNORECASE)
-    return normalize_whitespace(m.group(0)) if m else None
+    """Extract mileage (km/км) from text."""
+    match = re.search(r"(\d[\d\s]{2,6})\s*(км|km)", text, flags=re.IGNORECASE)
+    return normalize_whitespace(match.group(0)) if match else None
 
 
+# =============================
+# Content cleaner
+# =============================
+class ContentCleaner:
+    """Cleans HTML content for AI processing."""
+    
+    TAGS_TO_REMOVE = ["script", "style", "nav", "footer", "header", "iframe", "noscript", "aside"]
+    
+    def clean(self, html_content: str, max_length: int = CONFIG.max_content_length) -> str:
+        """Remove non-content tags and extract text."""
+        if not html_content:
+            return ""
+        soup = BeautifulSoup(html_content, "html.parser")
+        for tag in soup(self.TAGS_TO_REMOVE):
+            tag.decompose()
+        return soup.get_text(separator=" ", strip=True)[:max_length]
+
+
+# =============================
+# GigaChat client
+# =============================
+class GigaChatClient:
+    """Client for GigaChat API with token management."""
+    
+    def __init__(self, auth_data: str):
+        self.auth_data = auth_data
+        self._access_token: Optional[str] = None
+        self._token_expires_at: float = 0
+    
+    def _get_token(self) -> Optional[str]:
+        """Get or refresh access token."""
+        now = time.time()
+        if self._access_token and now < self._token_expires_at:
+            return self._access_token
+
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "RqUID": str(uuid.uuid4()),
+            "Authorization": f"Basic {self.auth_data}",
+        }
+        payload = {"scope": "GIGACHAT_API_PERS"}
+        
+        try:
+            resp = _requests_session.post(
+                CONFIG.gigachat_oauth_url,
+                headers=headers,
+                data=payload,
+                verify=False,
+                timeout=CONFIG.http_timeout
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            self._access_token = data["access_token"]
+            self._token_expires_at = data.get("expires_at", 0) / 1000 or now + 1700
+            return self._access_token
+        except requests.RequestException as exc:
+            logger.error(f"GigaChat auth error: {exc}")
+            return None
+    
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception_type(requests.RequestException)
+    )
+    def chat(
+        self,
+        system_prompt: str,
+        user_content: str,
+        temperature: float = 0.1,
+        max_tokens: int = 500
+    ) -> Optional[dict]:
+        """
+        Send chat completion request to GigaChat.
+        
+        Returns parsed JSON from response or None on failure.
+        """
+        token = self._get_token()
+        if not token:
+            return None
+
+        headers = {
+            "Content-Type": "application/json; charset=utf-8",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+        }
+        
+        payload = {
+            "model": CONFIG.gigachat_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        
+        max_retries = 3
+        base_retry_delay = 5  # Increased base delay
+        
+        for attempt in range(max_retries):
+            try:
+                gigachat_rate_limiter.wait_if_needed()
+                resp = _requests_session.post(
+                    CONFIG.gigachat_api_url,
+                    headers=headers,
+                    json=payload,
+                    verify=False,
+                    timeout=CONFIG.http_long_timeout
+                )
+                
+                # Handle 429 Too Many Requests
+                if resp.status_code == 429:
+                    # Try to get Retry-After header, otherwise use exponential backoff
+                    retry_after_header = resp.headers.get("Retry-After")
+                    if retry_after_header:
+                        try:
+                            retry_after = int(retry_after_header)
+                        except ValueError:
+                            retry_after = base_retry_delay * (2 ** attempt)
+                    else:
+                        retry_after = base_retry_delay * (2 ** attempt)  # Exponential backoff: 5, 10, 20
+                    
+                    logger.warning(f"Rate limited (429), waiting {retry_after}s before retry {attempt + 1}/{max_retries}")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_after)
+                        continue
+                    else:
+                        resp.raise_for_status()
+                
+                resp.raise_for_status()
+                result = resp.json()
+                content = result["choices"][0]["message"]["content"]
+                return safe_json_loads(content)
+            except requests.HTTPError as exc:
+                if exc.response and exc.response.status_code == 429 and attempt < max_retries - 1:
+                    retry_after_header = exc.response.headers.get("Retry-After")
+                    if retry_after_header:
+                        try:
+                            retry_after = int(retry_after_header)
+                        except ValueError:
+                            retry_after = base_retry_delay * (2 ** attempt)
+                    else:
+                        retry_after = base_retry_delay * (2 ** attempt)
+                    
+                    logger.warning(f"Rate limited (429), waiting {retry_after}s before retry {attempt + 1}/{max_retries}")
+                    time.sleep(retry_after)
+                    continue
+                logger.error(f"GigaChat API error: {exc}")
+                if attempt == max_retries - 1:
+                    raise
+            except requests.RequestException as exc:
+                logger.error(f"GigaChat API error: {exc}")
+                if attempt == max_retries - 1:
+                    raise
+                # Exponential backoff for network errors
+                time.sleep(base_retry_delay * (2 ** attempt))
+            except (KeyError, IndexError) as exc:
+                logger.error(f"GigaChat response parse error: {exc}")
+                return None
+        
+        # If all retries failed
+        return None
+
+
+# =============================
+# AI Analyzer
+# =============================
+class AIAnalyzer:
+    """AI-powered analysis using GigaChat."""
+    
+    ANALYSIS_PROMPT = """Ты аналитик рынка лизинга авто. По тексту объявления заполни поля и верни только JSON.
+Требуется:
+1) Категория (Category).
+2) Бренд и модель.
+3) 3–5 ключевых характеристик (Specs) — тип двигателя/привода, пробег, мощность/л.с., состояние и пр.
+4) Плюсы (Pros) и минусы/оговорки (Cons).
+5) Если в тексте упомянуты аналоги или конкуренты (например, "как Volvo ..."), добавь их в analogs_mentioned.
+
+Структура ответа:
+{
+  "category": "string (например: 'легковые автомобили', 'коммерческий транспорт')",
+  "vendor": "string (производитель, например: 'Volvo', 'BMW')",
+  "model": "string (модель, например: 'XC60', 'X5 M')",
+  "price": int (цена в валюте, null если нет или "по запросу"),
+  "currency": "string (RUB, USD, EUR)",
+  "monthly_payment": int (платёж в месяц, null если нет),
+  "year": int (год выпуска),
+  "condition": "string (новый / б/у / не указан)",
+  "location": "string (город/регион)",
+  "specs": {
+    "характеристика_1": "значение",
+    "характеристика_2": "значение",
+    "характеристика_3": "значение"
+  },
+  "pros": ["плюс 1", "плюс 2"],
+  "cons": ["минус 1", "минус 2"],
+  "analogs_mentioned": ["аналог 1", "аналог 2"]
+}
+Отдавай только JSON без markdown."""
+
+    ANALOGS_PROMPT = (
+        "Ты подбираешь аналоги оборудования/техники. "
+        "На входе строка с предметом (марка/модель). "
+        "Верни JSON {\"analogs\": [\"модель1\", \"модель2\", ...]} максимум 5 элементов."
+    )
+    
+    REVIEW_PROMPT = (
+        "Ты сравниваешь модели техники и формируешь лаконичный обзор.\n"
+        "На входе название аналога и несколько заголовков объявлений.\n"
+        "Верни JSON с ключами: pros (<=3), cons (<=3), price_hint (int|null), note (str), best_link (str|null)."
+    )
+    
+    VALIDATION_PROMPT = (
+        "Ты — финансовый аналитик. Проверь рыночную оценку.\n"
+        "Если цена кажется адекватной для указанного оборудования, верни 'is_valid': true.\n"
+        "Если цена на порядок отличается от реальности (например, буровая за 100 рублей или телефон за 1млрд), 'is_valid': false.\n"
+        "Верни JSON: {\"is_valid\": bool, \"comment\": \"reason\"}"
+    )
+    
+    SPECS_EXTRACTION_PROMPT = """Ты эксперт по техническим характеристикам. Проанализируй текст со специализированного сайта с характеристиками и извлеки ВСЕ технические характеристики.
+
+Текст может содержать:
+- Технические характеристики (двигатель, мощность, объем, трансмиссия, привод, габариты, вес и т.д.)
+- Комплектации и опции
+- Производительность
+- Расход топлива/энергии
+- Безопасность и оснащение
+
+Верни JSON с максимально полным набором характеристик:
+{{
+  "specs": {{
+    "двигатель": "тип, объем, мощность",
+    "мощность": "л.с. или кВт",
+    "крутящий_момент": "Нм",
+    "трансмиссия": "тип коробки передач",
+    "привод": "передний/задний/полный",
+    "расход_топлива": "л/100км",
+    "разгон_0_100": "секунды",
+    "максимальная_скорость": "км/ч",
+    "габариты": "длина x ширина x высота",
+    "вес": "кг",
+    "объем_багажника": "литры",
+    "тип_кузова": "седан/внедорожник/хэтчбек и т.д.",
+    "количество_мест": "число",
+    "комплектация": "базовая/средняя/топ",
+    "оснащение": "список опций",
+    "безопасность": "системы безопасности",
+    "мультимедиа": "системы развлечения",
+    "дополнительно": "любые другие характеристики"
+  }}
+}}
+
+Извлекай ВСЕ найденные характеристики, даже если их много. Не ограничивайся только основными."""
+    
+    COMPARE_OFFERS_PROMPT = """Ты эксперт по оценке объявлений для лизинга. Сравни два объявления и определи, какое лучше.
+
+Объявление 1:
+{offer1}
+
+Объявление 2:
+{offer2}
+
+Критерии сравнения:
+1. Адекватность цены (соответствие рыночной стоимости)
+2. Состояние и характеристики
+3. Наличие важных параметров
+4. Надежность источника
+5. Общее качество предложения
+
+Верни JSON:
+{{
+  "winner": 1 или 2 (какое объявление лучше),
+  "score_1": float от 0 до 10 (оценка первого объявления),
+  "score_2": float от 0 до 10 (оценка второго объявления),
+  "reason": "краткое объяснение почему выбран победитель",
+  "pros_winner": ["плюс 1", "плюс 2"],
+  "cons_winner": ["минус 1", "минус 2"],
+  "pros_loser": ["плюс 1", "плюс 2"],
+  "cons_loser": ["минус 1", "минус 2"]
+}}"""
+
+    FIND_BEST_OFFER_PROMPT = """Ты эксперт по оценке объявлений для лизинга. Из списка объявлений найди ЛУЧШЕЕ.
+
+Объявления:
+{offers_list}
+
+Критерии выбора лучшего:
+1. Адекватность цены (соответствие рыночной стоимости)
+2. Состояние и характеристики
+3. Полнота информации
+4. Надежность источника
+5. Общее качество предложения
+
+Верни JSON:
+{{
+  "best_index": int (индекс лучшего объявления, начиная с 0),
+  "best_score": float от 0 до 10,
+  "reason": "почему это объявление лучшее",
+  "ranking": [
+    {{"index": 0, "score": 8.5, "brief_reason": "..."}},
+    {{"index": 1, "score": 7.2, "brief_reason": "..."}}
+  ]
+}}"""
+
+    COMPARE_BEST_OFFERS_PROMPT = """Ты эксперт по лизингу. Проведи ДЕТАЛЬНОЕ СРАВНЕНИЕ лучшего объявления оригинала с лучшим объявлением аналога.
+
+Твоя задача - не просто описать плюсы и минусы, а ПРЯМО СРАВНИТЬ эти два предложения по ключевым критериям:
+1. Цена и стоимость владения
+2. Технические характеристики и качество
+3. Условия лизинга и финансирования
+4. Надежность и репутация
+5. Соответствие потребностям клиента
+
+Лучшее объявление ОРИГИНАЛА ({original_name}):
+{best_original}
+
+Лучшее объявление АНАЛОГА ({analog_name}):
+{best_analog}
+
+Проведи ПОСЛЕДОВАТЕЛЬНОЕ сравнение по каждому критерию и вынеси обоснованное решение.
+
+Верни JSON:
+{{
+  "winner": "original" или "analog",
+  "original_score": float от 0 до 10,
+  "analog_score": float от 0 до 10,
+  "comparison_details": {{
+    "price": "детальное сравнение цен и стоимости",
+    "quality": "сравнение качества и характеристик",
+    "financing": "сравнение условий лизинга",
+    "reliability": "сравнение надежности",
+    "value": "сравнение соотношения цена/качество"
+  }},
+  "price_comparison": {{
+    "original_price": int,
+    "analog_price": int,
+    "difference_percent": float,
+    "price_verdict": "original_cheaper" | "analog_cheaper" | "similar",
+    "monthly_payment_original": int или null,
+    "monthly_payment_analog": int или null
+  }},
+  "pros_original": ["конкретное преимущество оригинала", "еще преимущество"],
+  "cons_original": ["конкретный недостаток оригинала", "еще недостаток"],
+  "pros_analog": ["конкретное преимущество аналога", "еще преимущество"],
+  "cons_analog": ["конкретный недостаток аналога", "еще недостаток"],
+  "recommendation": "детальная рекомендация с обоснованием выбора",
+  "use_cases_original": ["конкретная ситуация когда лучше выбрать оригинал"],
+  "use_cases_analog": ["конкретная ситуация когда лучше выбрать аналог"],
+  "key_differences": ["главное отличие 1", "главное отличие 2", "главное отличие 3"]
+}}"""
+    
+    def __init__(self, client: GigaChatClient, cleaner: ContentCleaner):
+        self.client = client
+        self.cleaner = cleaner
+    
+    def analyze_content(self, html_content: str) -> Optional[AIAnalysisResult]:
+        """Analyze HTML content and extract structured data."""
+        text = self.cleaner.clean(html_content)
+        if not text:
+            return None
+        
+        try:
+            result = self.client.chat(
+                self.ANALYSIS_PROMPT,
+                text,
+                temperature=0.1,
+                max_tokens=1500
+            )
+            return result
+        except requests.RequestException:
+            logger.warning("Failed to analyze content with AI")
+            return None
+    
+    def suggest_analogs(self, item_name: str) -> list[str]:
+        """Get analog suggestions from AI."""
+        try:
+            result = self.client.chat(
+                self.ANALOGS_PROMPT,
+                item_name,
+                temperature=0.2,
+                max_tokens=500
+            )
+            if result:
+                return ensure_list_str(result.get("analogs"))
+        except requests.RequestException:
+            logger.warning(f"Failed to get analog suggestions for {item_name}")
+        return []
+    
+    def extract_specs_from_text(self, text: str) -> dict:
+        """Extract technical specifications from text using AI."""
+        if not text or len(text.strip()) < 50:
+            return {}
+        
+        try:
+            result = self.client.chat(
+                self.SPECS_EXTRACTION_PROMPT,
+                text[:8000],  # Limit text length
+                temperature=0.1,
+                max_tokens=2000
+            )
+            if result and "specs" in result:
+                return result["specs"]
+        except requests.RequestException as e:
+            logger.warning(f"Failed to extract specs with AI: {e}")
+        return {}
+    
+    def review_analog(self, analog_name: str, listings: list[dict]) -> AnalogReview:
+        """Get AI review of an analog model."""
+        listings_text = "\n".join(
+            f"- {l.get('title', '')} ({l.get('link', '')}) {l.get('snippet', '')}"
+            for l in listings
+        )
+        user_content = f"Модель: {analog_name}\nОбъявления:\n{listings_text}"
+        
+        try:
+            result = self.client.chat(
+                self.REVIEW_PROMPT,
+                user_content,
+                temperature=0.2,
+                max_tokens=600
+            )
+            return result or {}
+        except requests.RequestException:
+            logger.warning(f"Failed to review analog {analog_name}")
+            return {}
+    
+    def validate_report(self, report: dict) -> ValidationResult:
+        """Validate market report with AI sanity check."""
+        summary = {
+            "item": report.get("item"),
+            "median_price": report.get("median_price"),
+            "mean_price": report.get("mean_price"),
+            "market_range": report.get("market_range"),
+            "offers_count": len(report.get("offers_used", [])),
+        }
+        details = json.dumps(summary, ensure_ascii=False, default=str)
+        
+        try:
+            result = self.client.chat(
+                self.VALIDATION_PROMPT,
+                f"Отчет:\n{details}",
+                temperature=0.1,
+                max_tokens=500
+            )
+            return result or {"is_valid": True, "comment": "Parse error"}
+        except requests.RequestException:
+            logger.warning("Failed to validate report with AI")
+            return {"is_valid": True, "comment": "AI not available"}
+    
+    def compare_two_offers(self, offer1: dict, offer2: dict) -> dict:
+        """Compare two offers and determine which is better."""
+        offer1_str = json.dumps(offer1, ensure_ascii=False, default=str, indent=2)
+        offer2_str = json.dumps(offer2, ensure_ascii=False, default=str, indent=2)
+        
+        prompt = self.COMPARE_OFFERS_PROMPT.format(
+            offer1=offer1_str,
+            offer2=offer2_str
+        )
+        
+        try:
+            result = self.client.chat(
+                prompt,
+                "Сравни объявления",
+                temperature=0.2,
+                max_tokens=800
+            )
+            return result or {"winner": 1, "score_1": 5.0, "score_2": 5.0, "reason": "Comparison failed"}
+        except requests.RequestException:
+            logger.warning("Failed to compare offers")
+            return {"winner": 1, "score_1": 5.0, "score_2": 5.0, "reason": "AI unavailable"}
+    
+    def find_best_offer(self, offers: list[dict]) -> dict:
+        """Find the best offer from a list of offers."""
+        if not offers:
+            return {"best_index": -1, "best_score": 0.0, "reason": "No offers"}
+        
+        if len(offers) == 1:
+            return {"best_index": 0, "best_score": 8.0, "reason": "Only one offer", "ranking": [{"index": 0, "score": 8.0, "brief_reason": "Single offer"}]}
+        
+        # Format offers for AI
+        offers_list = "\n\n".join([
+            f"Объявление {i}:\n{json.dumps(offer, ensure_ascii=False, default=str, indent=2)}"
+            for i, offer in enumerate(offers, 1)
+        ])
+        
+        prompt = self.FIND_BEST_OFFER_PROMPT.format(offers_list=offers_list)
+        
+        try:
+            result = self.client.chat(
+                prompt,
+                "Найди лучшее объявление",
+                temperature=0.2,
+                max_tokens=1000
+            )
+            if result and "best_index" in result:
+                return result
+            else:
+                # Fallback: return first offer
+                return {"best_index": 0, "best_score": 7.0, "reason": "AI parsing failed", "ranking": []}
+        except requests.RequestException:
+            logger.warning("Failed to find best offer")
+            # Fallback: return first offer
+            return {"best_index": 0, "best_score": 7.0, "reason": "AI unavailable", "ranking": []}
+    
+    def compare_best_offers(self, best_original: dict, best_analog: dict, original_name: str, analog_name: str) -> dict:
+        """Compare best original offer with best analog offer."""
+        original_str = json.dumps(best_original, ensure_ascii=False, default=str, indent=2)
+        analog_str = json.dumps(best_analog, ensure_ascii=False, default=str, indent=2)
+        
+        prompt = self.COMPARE_BEST_OFFERS_PROMPT.format(
+            original_name=original_name,
+            best_original=original_str,
+            analog_name=analog_name,
+            best_analog=analog_str
+        )
+        
+        try:
+            result = self.client.chat(
+                prompt,
+                "Сравни лучшие объявления",
+                temperature=0.2,
+                max_tokens=1200
+            )
+            return result or {
+                "winner": "original",
+                "original_score": 5.0,
+                "analog_score": 5.0,
+                "recommendation": "Comparison failed"
+            }
+        except requests.RequestException:
+            logger.warning("Failed to compare best offers")
+            return {
+                "winner": "original",
+                "original_score": 5.0,
+                "analog_score": 5.0,
+                "recommendation": "AI unavailable"
+            }
+
+
+# =============================
+# Generic Parser Strategy (after AIAnalyzer)
+# =============================
+class GenericParserStrategy(ParserStrategy):
+    """Generic parser using basic regex + AI."""
+    
+    def __init__(self, analyzer: Optional[AIAnalyzer], use_ai: bool = True):
+        self.analyzer = analyzer
+        self.use_ai = use_ai
+    
+    def parse(self, html: str, url: str, model_name: str, title: str = "") -> list["LeasingOffer"]:
+        """Parse generic page using basic + AI parsing."""
+        # Basic parsing
+        basic = parse_page_basic(html, model_name)
+        
+        # AI parsing
+        ai_result = None
+        if self.use_ai and self.analyzer:
+            ai_result = self.analyzer.analyze_content(html)
+        
+        # Merge results
+        merged = dict(basic)
+        if ai_result:
+            for k, v in ai_result.items():
+                if v is not None:
+                    merged[k] = v
+        
+        if not merged:
+            return []
+        
+        # Create offer with enrichment
+        domain = urlparse(url).netloc.replace("www.", "")
+        offer = create_offer_from_merged(
+            title=title or "Offer",
+            url=url,
+            domain=domain,
+            model_name=model_name,
+            merged=merged,
+            text=html[:5000] if html else ""  # Pass first 5000 chars for enrichment
+        )
+        
+        if offer and offer.has_data():
+            return [offer]
+        return []
+
+
+# =============================
+# Avito parsing
+# =============================
 def extract_offers_from_ld_json(html: str) -> list[dict]:
+    """Extract structured data from JSON-LD scripts."""
     offers = []
     soup = BeautifulSoup(html or "", "html.parser")
     scripts = soup.find_all("script", {"type": "application/ld+json"})
+    
     for script in scripts:
         data = safe_json_loads(script.get_text(strip=True))
         if not data:
             continue
         items = data if isinstance(data, list) else [data]
+        
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -228,12 +1399,14 @@ def extract_offers_from_ld_json(html: str) -> list[dict]:
 
 
 def parse_avito_list_page(html: str, model_name: str) -> list[LeasingOffer]:
+    """Parse Avito listing page and extract offers."""
     soup = BeautifulSoup(html or "", "html.parser")
     cards = soup.select('[data-marker="item"]')
     if not cards:
         cards = soup.select("div.iva-item-root")
 
     offers: list[LeasingOffer] = []
+    
     for card in cards:
         title_tag = card.select_one('[data-marker="item-title"]') or card.select_one("a")
         if not title_tag:
@@ -244,6 +1417,7 @@ def parse_avito_list_page(html: str, model_name: str) -> list[LeasingOffer]:
 
         href = title_tag.get("href") or ""
         url = normalize_url(href)
+        
         price_tag = card.select_one('[data-marker="item-price"]') or card.select_one("meta[itemprop='price']")
         price_val = None
         price_display = None
@@ -259,23 +1433,30 @@ def parse_avito_list_page(html: str, model_name: str) -> list[LeasingOffer]:
         year = _extract_year_from_text(subtitle)
         power = _extract_power(subtitle)
         mileage = _extract_mileage(subtitle)
-
-        offers.append(
-            LeasingOffer(
-                title=title,
-                url=url,
-                source="avito.ru",
-                model=model_name,
-                price=price_val,
-                price_str=price_display,
-                location=location,
-                year=year,
-                power=power,
-                mileage=mileage,
-            )
+        
+        # Create merged dict for validation
+        merged_data = {
+            "price": price_val,
+            "year": year,
+            "power": power,
+            "mileage": mileage,
+            "location": location,
+        }
+        
+        # Validate and create offer using improved function
+        offer = create_offer_from_merged(
+            title=title,
+            url=url,
+            domain="avito.ru",
+            model_name=model_name,
+            merged=merged_data,
+            text=subtitle
         )
+        
+        if offer:
+            offers.append(offer)
 
-    # LD-JSON as supplemental source
+    # JSON-LD as supplemental source
     for item in extract_offers_from_ld_json(html):
         name = normalize_whitespace(item.get("name", "") or item.get("title", ""))
         href = item.get("url") or item.get("mainEntityOfPage") or ""
@@ -284,18 +1465,24 @@ def parse_avito_list_page(html: str, model_name: str) -> list[LeasingOffer]:
             continue
         if not is_relevant_avito_title(name, model_name):
             continue
-        offers.append(
-            LeasingOffer(
-                title=name or "Offer",
-                url=normalize_url(href),
-                source="avito.ru",
-                model=model_name,
-                price=price_val,
-                price_str=format_price(price_val),
-                location=normalize_whitespace(item.get("address", "")) or None,
-                year=_extract_year_from_text(name),
-            )
+        
+        merged_data = {
+            "price": price_val,
+            "location": normalize_whitespace(item.get("address", "")) or None,
+            "year": _extract_year_from_text(name),
+        }
+        
+        offer = create_offer_from_merged(
+            title=name or "Offer",
+            url=normalize_url(href),
+            domain="avito.ru",
+            model_name=model_name,
+            merged=merged_data,
+            text=name
         )
+        
+        if offer:
+            offers.append(offer)
 
     return offers
 
@@ -304,295 +1491,204 @@ def parse_avito_list_page(html: str, model_name: str) -> list[LeasingOffer]:
 # Selenium handling
 # =============================
 class SeleniumFetcher:
+    """Selenium-based page fetcher with lazy initialization and auto-recovery."""
+    
     def __init__(self):
         self.driver: Optional[webdriver.Chrome] = None
-        self.chrome_options = Options()
-        self.chrome_options.add_argument("--headless=new")
-        self.chrome_options.add_argument("--disable-gpu")
-        self.chrome_options.add_argument("--no-sandbox")
-        self.chrome_options.add_argument("--window-size=1920,1080")
-        self.chrome_options.add_argument("--log-level=3")
-        self.chrome_options.add_argument("--disable-logging")
-        self.chrome_options.add_argument("--disable-dev-shm-usage")
-        self.chrome_options.add_experimental_option("excludeSwitches", ["enable-logging"])
-        self.chrome_options.add_argument(
+        self._options: Optional[Options] = None
+        self._max_restart_attempts = 3
+    
+    def _get_options(self) -> Options:
+        """Get Chrome options (lazy initialization)."""
+        if self._options is None:
+            self._options = Options()
+            self._options.add_argument("--headless=new")
+            self._options.add_argument("--disable-gpu")
+            self._options.add_argument("--no-sandbox")
+            self._options.add_argument("--window-size=1920,1080")
+            self._options.add_argument("--log-level=3")
+            self._options.add_argument("--disable-logging")
+            self._options.add_argument("--disable-dev-shm-usage")
+            self._options.add_experimental_option("excludeSwitches", ["enable-logging"])
+            self._options.add_argument(
             "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
         )
+        return self._options
 
+    def _is_driver_alive(self) -> bool:
+        """Check if driver is still responsive."""
+        if not self.driver:
+            return False
+        try:
+            # Try a simple operation to check if driver is alive
+            self.driver.current_url
+            return True
+        except Exception:
+            return False
+    
+    def _restart_driver(self):
+        """Restart driver after connection error."""
+        logger.warning("Restarting Chrome driver due to connection issues...")
+        self.close()
+        time.sleep(2)  # Give ChromeDriver time to fully close
+        self.driver = None  # Force recreation
+    
     def _get_driver(self) -> webdriver.Chrome:
-        if self.driver:
+        """Get or create Chrome driver with health check."""
+        if self.driver and self._is_driver_alive():
             return self.driver
-        self.driver = webdriver.Chrome(options=self.chrome_options)
-        return self.driver
+        
+        # Driver is dead or doesn't exist, create new one
+        if self.driver:
+            logger.warning("Driver is not responsive, recreating...")
+            self.close()
+        
+        try:
+            self.driver = webdriver.Chrome(options=self._get_options())
+            # Set timeouts
+            self.driver.set_page_load_timeout(CONFIG.page_load_timeout)
+            self.driver.implicitly_wait(CONFIG.implicit_wait)
+            self.driver.set_script_timeout(CONFIG.script_timeout)
+            logger.debug("Chrome driver created successfully")
+            return self.driver
+        except Exception as e:
+            logger.error(f"Failed to create Chrome driver: {e}")
+            self.driver = None
+            raise
 
     def close(self):
+        """Close driver and release resources."""
         if self.driver:
             try:
                 self.driver.quit()
+            except Exception as e:
+                logger.debug(f"Error closing driver: {e}")
             finally:
                 self.driver = None
 
-    def fetch_page(self, url: str, scroll_times: int = 2, wait: float = 1.5) -> Optional[str]:
-        driver = self._get_driver()
-        try:
-            driver.get(url)
-            last_height = driver.execute_script("return document.body.scrollHeight")
-            for _ in range(max(0, scroll_times)):
-                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(wait)
-                new_height = driver.execute_script("return document.body.scrollHeight")
-                if new_height == last_height:
-                    break
-                last_height = new_height
-            return driver.page_source
-        except Exception as e:
-            print(f"[!] Не удалось загрузить {url}: {e}")
+    def fetch_page(
+        self,
+        url: str,
+        scroll_times: int = CONFIG.default_scroll_times,
+        wait: float = CONFIG.scroll_wait
+    ) -> Optional[str]:
+        """Fetch page with scrolling to load dynamic content, with auto-recovery."""
+        if not is_valid_url(url):
+            logger.warning(f"Invalid URL: {url}")
             return None
-
-
-# =============================
-# AI analyzer (GigaChat)
-# =============================
-class LeasingAssetAnalyzer:
-    def __init__(self, gigachat_auth_data: str, fetcher: SeleniumFetcher):
-        self.gigachat_auth_data = gigachat_auth_data
-        self.fetcher = fetcher
-        self.access_token = None
-        self.token_expires_at = 0
-
-    def _get_gigachat_token(self) -> Optional[str]:
-        now = time.time()
-        if self.access_token and now < self.token_expires_at:
-            return self.access_token
-
-        url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-            "RqUID": str(uuid.uuid4()),
-            "Authorization": f"Basic {self.gigachat_auth_data}",
-        }
-        payload = {"scope": "GIGACHAT_API_PERS"}
-        try:
-            resp = requests.post(url, headers=headers, data=payload, verify=False, timeout=20)
-            resp.raise_for_status()
-            data = resp.json()
-            self.access_token = data["access_token"]
-            self.token_expires_at = data.get("expires_at", 0) / 1000 or now + 1700
-            return self.access_token
-        except Exception as exc:
-            print(f"[!] Ошибка авторизации GigaChat: {exc}")
-            return None
-
-    def clean_content(self, html_content: str) -> str:
-        if not html_content:
-            return ""
-        soup = BeautifulSoup(html_content, "html.parser")
-        for tag in soup(["script", "style", "nav", "footer", "header", "iframe", "noscript"]):
-            tag.decompose()
-        return soup.get_text(separator=" ", strip=True)[:10000]
-
-    def analyze_with_ai(self, text_content: str) -> Optional[dict]:
-        if not text_content:
-            return None
-        token = self._get_gigachat_token()
-        if not token:
-            return None
-
-        url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
-        headers = {
-            "Content-Type": "application/json; charset=utf-8",
-            "Accept": "application/json",
-            "Authorization": f"Bearer {token}",
-        }
-        system_prompt = """Ты аналитик рынка лизинга авто. По тексту объявления заполни поля и верни только JSON.
-Требуется:
-1) Категория (Category).
-2) Бренд и модель.
-3) 3–5 ключевых характеристик (Specs) — тип двигателя/привода, пробег, мощность/л.с., состояние и пр.
-4) Плюсы (Pros) и минусы/оговорки (Cons).
-5) Если в тексте упомянуты аналоги или конкуренты (например, “как Volvo ...”), добавь их в analogs_mentioned.
-
-Структура ответа:
-{
-  "category": "string (например: 'легковые автомобили', 'коммерческий транспорт')",
-  "vendor": "string (производитель, например: 'Volvo', 'BMW')",
-  "model": "string (модель, например: 'XC60', 'X5 M')",
-  "price": int (цена в валюте, null если нет или “по запросу”),
-  "currency": "string (RUB, USD, EUR)",
-  "monthly_payment": int (платёж в месяц, null если нет),
-  "year": int (год выпуска),
-  "condition": "string (новый / б/у / не указан)",
-  "location": "string (город/регион)",
-  "specs": {
-    "характеристика_1": "значение",
-    "характеристика_2": "значение",
-    "характеристика_3": "значение"
-  },
-  "pros": ["плюс 1", "плюс 2"],
-  "cons": ["минус 1", "минус 2"],
-  "analogs_mentioned": ["аналог 1", "аналог 2"]
-}
-Отдавай только JSON без markdown."""
-
-        payload = {
-            "model": "GigaChat-2",
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": text_content},
-            ],
-            "temperature": 0.1,
-            "max_tokens": 1500,
-        }
-        try:
-            resp = requests.post(url, headers=headers, json=payload, verify=False, timeout=40)
-            resp.raise_for_status()
-            result = resp.json()
-            content = result["choices"][0]["message"]["content"]
-            return safe_json_loads(content)
-        except Exception as exc:
-            print(f"[!] ?? ??????? ??????? GigaChat: {exc}")
-            return None
-
-    def fetch_page(self, url: str, scroll_times: int = 2, wait: float = 1.5) -> Optional[str]:
-        return self.fetcher.fetch_page(url, scroll_times=scroll_times, wait=wait)
-
-    def suggest_analogs(self, item_name: str) -> list[str]:
-        """Ask LLM for close analog models when текст объявления недоступен или данных мало."""
-        token = self._get_gigachat_token()
-        if not token:
-            return []
-        url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
-        headers = {
-            "Content-Type": "application/json; charset=utf-8",
-            "Accept": "application/json",
-            "Authorization": f"Bearer {token}",
-        }
-        system_prompt = (
-            "Ты подбираешь аналоги оборудования/техники. "
-            "На входе строка с предметом (марка/модель). "
-            "Верни JSON {\"analogs\": [\"модель1\", \"модель2\", ...]} максимум 5 элементов."
-        )
-        payload = {
-            "model": "GigaChat-2",
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": item_name},
-            ],
-            "temperature": 0.2,
-            "max_tokens": 500,
-        }
-        try:
-            resp = requests.post(url, headers=headers, json=payload, verify=False, timeout=20)
-            resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"]
-            data = safe_json_loads(content) or {}
-            return ensure_list_str(data.get("analogs"))
-        except Exception as exc:
-            print(f"[!] Не удалось запросить аналоги: {exc}")
-            return []
-
-    def review_analog(self, analog_name: str, listings: list[dict]) -> dict:
-        """
-        Получить краткий анализ аналога: ключевые плюсы/минусы и примерную цену на основе найденных объявлений.
-        """
-        token = self._get_gigachat_token()
-        if not token:
-            return {}
-        url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
-        headers = {
-            "Content-Type": "application/json; charset=utf-8",
-            "Accept": "application/json",
-            "Authorization": f"Bearer {token}",
-        }
-        listings_text = "\n".join(
-            f"- {l.get('title','')} ({l.get('link','')}) {l.get('snippet','')}"
-            for l in listings
-        )
-        system_prompt = (
-            "Ты сравниваешь модели техники и формируешь лаконичный обзор.\n"
-            "На входе название аналога и несколько заголовков объявлений.\n"
-            "Верни JSON с ключами: pros (<=3), cons (<=3), price_hint (int|null), note (str), best_link (str|null)."
-        )
-        user_content = f"Модель: {analog_name}\nОбъявления:\n{listings_text}"
-        payload = {
-            "model": "GigaChat-2",
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content},
-            ],
-            "temperature": 0.2,
-            "max_tokens": 600,
-        }
-        try:
-            resp = requests.post(url, headers=headers, json=payload, verify=False, timeout=20)
-            resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"]
-            return safe_json_loads(content) or {}
-        except Exception as exc:
-            print(f"[!] Не удалось проанализировать аналог {analog_name}: {exc}")
-            return {}
-
-    def validate_report(self, report: dict) -> dict:
-        """
-        Ask LLM to sanity check the market report.
-        """
-        token = self._get_gigachat_token()
-        if not token:
-            return {"is_valid": True, "comment": "AI not available"}
-
-        url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
-        headers = {
-            "Content-Type": "application/json; charset=utf-8",
-            "Accept": "application/json",
-            "Authorization": f"Bearer {token}",
-        }
-
-        # Simplified report for validation
-        summary_report = {
-            "item": report.get("item"),
-            "median_price": report.get("median_price"),
-            "mean_price": report.get("mean_price"),
-            "market_range": report.get("market_range"),
-            "offers_count": len(report.get("offers_used", [])),
-        }
-        details = json.dumps(summary_report, ensure_ascii=False, default=str)
-        system_prompt = (
-            "Ты — финансовый аналитик. Проверь рыночную оценку.\n"
-            "Если цена кажется адекватной для указанного оборудования, верни 'is_valid': true.\n"
-            "Если цена на порядок отличается от реальности (например, буровая за 100 рублей или телефон за 1млрд), 'is_valid': false.\n"
-            "Верни JSON: {\"is_valid\": bool, \"comment\": \"reason\"}"
-        )
-
-        payload = {
-            "model": "GigaChat-2",
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Отчет:\n{details}"},
-            ],
-            "temperature": 0.1,
-            "max_tokens": 500,
-        }
-
-        try:
-            resp = requests.post(url, headers=headers, json=payload, verify=False, timeout=20)
-            resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"]
-            return safe_json_loads(content) or {"is_valid": True, "comment": "Parse error"}
-        except Exception as e:
-            print(f"[!] Validation warning: {e}")
-            return {"is_valid": True}
-
+        
+        for attempt in range(self._max_restart_attempts):
+            try:
+                driver = self._get_driver()
+                
+                # Try to load page with timeout
+                try:
+                    driver.set_page_load_timeout(CONFIG.page_load_timeout)
+                    driver.get(url)
+                except TimeoutException:
+                    # If page load times out, try to get what we have
+                    logger.warning(f"Page load timeout for {url}, trying to get partial content...")
+                    try:
+                        # Try to get page source anyway
+                        return driver.page_source
+                    except Exception as e:
+                        logger.debug(f"Could not get partial content: {e}")
+                        # Check if driver is still alive
+                        if not self._is_driver_alive():
+                            logger.warning("Driver died after timeout, restarting...")
+                            self._restart_driver()
+                            if attempt < self._max_restart_attempts - 1:
+                                continue
+                        return None
+                
+                # Scroll with timeout protection
+                try:
+                    last_height = driver.execute_script("return document.body.scrollHeight")
+                    
+                    for _ in range(max(0, scroll_times)):
+                        try:
+                            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                            time.sleep(wait)
+                            new_height = driver.execute_script("return document.body.scrollHeight")
+                            if new_height == last_height:
+                                break
+                            last_height = new_height
+                        except Exception as scroll_err:
+                            logger.debug(f"Scroll error for {url}: {scroll_err}")
+                            # Check if driver is still alive
+                            if not self._is_driver_alive():
+                                logger.warning("Driver died during scroll, restarting...")
+                                self._restart_driver()
+                                if attempt < self._max_restart_attempts - 1:
+                                    break  # Break scroll loop, will retry fetch
+                            else:
+                                break  # Just break scroll loop, continue with page source
+                except Exception as scroll_err:
+                    logger.debug(f"Scroll failed for {url}: {scroll_err}")
+                    # Check if driver is still alive
+                    if not self._is_driver_alive():
+                        logger.warning("Driver died during scroll, restarting...")
+                        self._restart_driver()
+                        if attempt < self._max_restart_attempts - 1:
+                            continue
+                    # Continue anyway, we might have some content
+                
+                # Successfully got page source
+                try:
+                    return driver.page_source
+                except Exception as e:
+                    logger.debug(f"Could not get page source: {e}")
+                    if not self._is_driver_alive():
+                        logger.warning("Driver died when getting page source, restarting...")
+                        self._restart_driver()
+                        if attempt < self._max_restart_attempts - 1:
+                            continue
+                    return None
+                    
+            except TimeoutException as e:
+                logger.warning(f"Timeout loading {url}: {e}")
+                if attempt < self._max_restart_attempts - 1:
+                    self._restart_driver()
+                    time.sleep(1)
+                    continue
+                return None
+            except Exception as e:
+                error_str = str(e).lower()
+                # Check for connection errors
+                if any(keyword in error_str for keyword in [
+                    "connection", "winerror 10061", "refused", 
+                    "newconnectionerror", "max retries exceeded"
+                ]):
+                    logger.warning(f"Connection error loading {url}: {e}")
+                    if attempt < self._max_restart_attempts - 1:
+                        self._restart_driver()
+                        time.sleep(2)  # Wait longer for connection issues
+                        continue
+                    return None
+                else:
+                    logger.error(f"Failed to load {url}: {e}")
+                    if attempt < self._max_restart_attempts - 1:
+                        # For other errors, still try restart once
+                        self._restart_driver()
+                        time.sleep(1)
+                        continue
+                    return None
+        
+        # All attempts failed
+        logger.error(f"Failed to load {url} after {self._max_restart_attempts} attempts")
+        return None
 
 
 # =============================
 # Basic regex parsing for non-Avito pages
 # =============================
-def parse_page_basic(html_content: str, model_name: str) -> dict:
-    result = {}
+def parse_page_basic(html_content: str, model_name: str) -> BasicParseResult:
+    """Extract basic structured data from HTML using regex."""
+    result: BasicParseResult = {}
     if not html_content:
         return result
+    
     soup = BeautifulSoup(html_content, "html.parser")
     for tag in soup(["script", "style", "nav", "footer", "header", "aside", "noscript", "iframe"]):
         tag.decompose()
@@ -617,7 +1713,7 @@ def parse_page_basic(html_content: str, model_name: str) -> dict:
     if mileage:
         result["mileage"] = mileage
 
-    # vendor heuristic from model
+    # Vendor heuristic from model name
     if model_name:
         result.setdefault("vendor", model_name.split()[0])
 
@@ -627,22 +1723,156 @@ def parse_page_basic(html_content: str, model_name: str) -> dict:
 # =============================
 # Search and URL handling
 # =============================
-def search_google(query: str, num_results: int = 10) -> list[dict]:
-    if not SERPER_API_KEY:
-        print("[!] SERPER_API_KEY не задан.")
-        return []
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    retry=retry_if_exception_type(requests.RequestException)
+)
+def _search_google_request(query: str, num_results: int) -> list[SearchResult]:
+    """Make search request to Serper API (with retry and rate limiting)."""
+    google_rate_limiter.wait_if_needed()
+    resp = _requests_session.post(
+        "https://google.serper.dev/search",
+        headers={"X-API-KEY": CONFIG.serper_api_key, "Content-Type": "application/json"},
+        json={"q": query, "gl": "ru", "hl": "ru", "num": num_results},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json().get("organic", [])
+
+
+@lru_cache(maxsize=100)
+def search_google_cached(query: str, num_results: int = 10) -> tuple:
+    """Cached Google search via Serper API."""
+    if not CONFIG.serper_api_key:
+        logger.warning("SERPER_API_KEY not set")
+        return tuple()
     try:
-        resp = requests.post(
-            "https://google.serper.dev/search",
-            headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
-            json={"q": query, "gl": "ru", "hl": "ru", "num": num_results},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        return resp.json().get("organic", [])
-    except Exception as exc:
-        print(f"[!] Ошибка поиска: {exc}")
+        results = _search_google_request(query, num_results)
+        return tuple(results)
+    except requests.RequestException as exc:
+        logger.error(f"Search error: {exc}")
+        return tuple()
+
+
+def search_google(query: str, num_results: int = 10) -> list[dict]:
+    """Google search via Serper API (returns list for compatibility)."""
+    if not CONFIG.serper_api_key:
+        logger.warning("SERPER_API_KEY not set, skipping Google search")
         return []
+    
+    results = search_google_cached(query, num_results)
+    if not results:
+        logger.debug(f"No Google results for query: {query}")
+    return list(results)
+
+
+def search_specs_sites(item_name: str, num_sites: int = 5) -> list[dict]:
+    """Search for sites with technical specifications using targeted queries."""
+    if not CONFIG.serper_api_key:
+        return []
+    
+    # Build targeted search queries for specs
+    queries = [
+        f"{item_name} характеристики",
+        f"{item_name} технические характеристики",
+        f"{item_name} specs характеристики",
+        f"{item_name} полные характеристики",
+    ]
+    
+    all_results = []
+    seen_urls = set()
+    
+    for query in queries[:2]:  # Use first 2 queries to avoid too many requests
+        results = search_google(query, num_results=num_sites)
+        for result in results:
+            url = result.get("link", "")
+            if url and url not in seen_urls:
+                # Filter for specs-related sites
+                domain = urlparse(url).netloc.lower()
+                # Prefer known specs sites
+                specs_keywords = ["характеристики", "specs", "технические", "обзор", "комплектация"]
+                snippet = (result.get("snippet", "") + " " + result.get("title", "")).lower()
+                
+                if any(keyword in snippet for keyword in specs_keywords) or any(keyword in domain for keyword in ["auto", "car", "tech", "spec"]):
+                    seen_urls.add(url)
+                    all_results.append(result)
+                    if len(all_results) >= num_sites:
+                        break
+        
+        if len(all_results) >= num_sites:
+            break
+    
+    logger.info(f"Found {len(all_results)} specs sites for {item_name}")
+    return all_results[:num_sites]
+
+
+def extract_specs_from_multiple_sites(
+    item_name: str,
+    fetcher: "SeleniumFetcher",
+    analyzer: Optional[AIAnalyzer],
+    num_sites: int = 5
+) -> dict:
+    """Extract technical specifications by analyzing multiple specialized sites."""
+    if not analyzer:
+        logger.warning("AI analyzer not available for specs extraction")
+        return {}
+    
+    # Search for specs sites
+    specs_sites = search_specs_sites(item_name, num_sites)
+    if not specs_sites:
+        logger.warning(f"No specs sites found for {item_name}")
+        return {}
+    
+    all_specs = {}
+    successful_extractions = 0
+    
+    logger.info(f"Analyzing {len(specs_sites)} sites for {item_name} specifications...")
+    
+    for idx, site in enumerate(specs_sites, 1):
+        url = site.get("link", "")
+        title = site.get("title", "")
+        
+        if not url:
+            continue
+        
+        try:
+            # Fetch page content
+            html = fetcher.fetch_page(url, scroll_times=1, wait=1.0)
+            if not html:
+                logger.debug(f"Failed to fetch {url}")
+                continue
+            
+            # Clean and extract text
+            cleaner = ContentCleaner()
+            text = cleaner.clean(html)
+            
+            if len(text) < 100:
+                logger.debug(f"Insufficient content from {url}")
+                continue
+            
+            # Extract specs using AI
+            specs = analyzer.extract_specs_from_text(text)
+            
+            if specs:
+                # Merge specs (later sites can override earlier ones)
+                for key, value in specs.items():
+                    if value and (key not in all_specs or not all_specs[key]):
+                        all_specs[key] = value
+                
+                successful_extractions += 1
+                logger.debug(f"Extracted {len(specs)} specs from {title[:50]}...")
+            
+        except Exception as e:
+            logger.warning(f"Error extracting specs from {url}: {e}")
+            continue
+    
+    if all_specs:
+        logger.info(f"Successfully extracted {len(all_specs)} specifications from {successful_extractions} sites")
+    else:
+        logger.warning(f"Failed to extract specs from any site for {item_name}")
+    
+    return all_specs
 
 
 MANDATORY_SOURCES = [
@@ -662,24 +1892,25 @@ MANDATORY_SOURCES = [
 
 
 def generate_mandatory_urls(model_name: str) -> list[dict]:
+    """Generate URLs for mandatory leasing sources."""
     query_encoded = model_name.replace(" ", "+").lower()
     mandatory = []
     for source in MANDATORY_SOURCES:
         url = source["search_url"].format(query=query_encoded)
-        mandatory.append(
-            {
+        mandatory.append({
                 "link": url,
                 "title": f"{model_name} - {source['name']}",
                 "is_mandatory": True,
                 "source_name": source["name"],
-            }
-        )
+        })
     return mandatory
 
 
 def filter_search_results(results: list[dict], max_results: int = 10) -> list[dict]:
+    """Filter search results, removing blocked domains."""
     filtered = []
     blocked_domains = {"chelindleasing"}
+    
     for result in results:
         if len(filtered) >= max_results:
             break
@@ -692,8 +1923,10 @@ def filter_search_results(results: list[dict], max_results: int = 10) -> list[di
 
 
 def merge_with_mandatory(search_results: list[dict], mandatory: list[dict]) -> list[dict]:
+    """Merge search results with mandatory sources."""
     existing_domains = {urlparse(r.get("link", "")).netloc.replace("www.", "") for r in search_results}
     merged = []
+    
     for m in mandatory:
         domain = m.get("source_name", "")
         if domain not in existing_domains:
@@ -707,46 +1940,128 @@ def merge_with_mandatory(search_results: list[dict], mandatory: list[dict]) -> l
 # Market analysis
 # =============================
 def percentile(sorted_values: list[int], p: float) -> float:
+    """Calculate percentile from sorted values (safe for large integers)."""
     if not sorted_values:
         return 0.0
-    k = (len(sorted_values) - 1) * p
-    f = int(k)
-    c = min(f + 1, len(sorted_values) - 1)
-    if f == c:
-        return float(sorted_values[int(k)])
-    d0 = sorted_values[f] * (c - k)
-    d1 = sorted_values[c] * (k - f)
-    return float(d0 + d1)
+    try:
+        k = (len(sorted_values) - 1) * p
+        f = int(k)
+        c = min(f + 1, len(sorted_values) - 1)
+        if f == c:
+            val = sorted_values[int(k)]
+            # Safe conversion: if value is too large, return as is
+            try:
+                return float(val)
+            except OverflowError:
+                # For very large numbers, return the integer value as float representation
+                return float(str(val))
+        
+        # Calculate weighted average
+        d0 = sorted_values[f] * (c - k)
+        d1 = sorted_values[c] * (k - f)
+        result = d0 + d1
+        try:
+            return float(result)
+        except OverflowError:
+            # Fallback: use simple average
+            return float((sorted_values[f] + sorted_values[c]) / 2)
+    except (OverflowError, ValueError) as e:
+        logger.warning(f"Error calculating percentile: {e}, using middle value")
+        mid_idx = len(sorted_values) // 2
+        return float(sorted_values[mid_idx] if len(sorted_values) % 2 == 1 else (sorted_values[mid_idx - 1] + sorted_values[mid_idx]) / 2)
 
 
 def filter_price_outliers(offers: list[LeasingOffer]) -> list[LeasingOffer]:
+    """Remove price outliers using IQR method."""
     prices = [o.price for o in offers if o.price is not None]
-    if len(prices) < 5:
+    if len(prices) < CONFIG.outlier_min_samples:
         return offers
+    
     prices_sorted = sorted(prices)
     q1 = percentile(prices_sorted, 0.25)
     q3 = percentile(prices_sorted, 0.75)
     iqr = q3 - q1
-    lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+    lower = q1 - CONFIG.iqr_multiplier * iqr
+    upper = q3 + CONFIG.iqr_multiplier * iqr
+    
     filtered = [o for o in offers if o.price is None or (lower <= o.price <= upper)]
     removed = len(offers) - len(filtered)
     if removed:
-        print(f"[*] Удалено выбросов: {removed}")
+        logger.info(f"Removed {removed} price outliers")
     return filtered
 
 
-def collect_analogs(item_name: str, offers: list[LeasingOffer], use_ai: bool, analyzer: Optional[LeasingAssetAnalyzer]) -> list[str]:
+def filter_low_quality_offers(offers: list[LeasingOffer]) -> list[LeasingOffer]:
+    """Filter out low-quality offers (missing critical data, suspicious content)."""
+    if not offers:
+        return []
+    
+    filtered = []
+    removed = 0
+    
+    for offer in offers:
+        # Skip offers with suspiciously short titles
+        if len(offer.title.strip()) < 5:
+            logger.debug(f"Removing offer with too short title: {offer.title[:30]}")
+            removed += 1
+            continue
+        
+        # Skip offers with invalid URLs
+        if not is_valid_url(offer.url):
+            logger.debug(f"Removing offer with invalid URL: {offer.url}")
+            removed += 1
+            continue
+        
+        # Skip offers with suspicious prices (too small for leasing)
+        if offer.price is not None and offer.price < CONFIG.min_valid_price:
+            logger.debug(f"Removing offer with suspiciously low price: {offer.price}")
+            removed += 1
+            continue
+        
+        # Keep offers that have at least some meaningful data
+        has_meaningful_data = any([
+            offer.price is not None,
+            offer.monthly_payment is not None,
+            offer.price_on_request,
+            offer.year is not None,
+            offer.vendor,
+            offer.specs,
+        ])
+        
+        if not has_meaningful_data:
+            logger.debug(f"Removing offer with no meaningful data: {offer.title[:50]}")
+            removed += 1
+            continue
+        
+        filtered.append(offer)
+    
+    if removed > 0:
+        logger.info(f"Filtered out {removed} low-quality offers (kept {len(filtered)})")
+    
+    return filtered
+
+
+def collect_analogs(
+    item_name: str,
+    offers: list[LeasingOffer],
+    use_ai: bool,
+    analyzer: Optional[AIAnalyzer]
+) -> list[str]:
+    """Collect analog models from offers and AI suggestions."""
     analogs_set = set()
+    
     for o in offers:
         for a in o.analogs:
             analogs_set.add(a.strip())
+    
     # If not enough analogs, try AI suggestion
-    if len(analogs_set) < 3 and use_ai and analyzer:
+    if len(analogs_set) < CONFIG.min_analogs_before_ai and use_ai and analyzer:
         ai_analogs = analyzer.suggest_analogs(item_name)
         for a in ai_analogs:
             analogs_set.add(a)
-    # Fallback: simple search titles for "аналог" results
-    if len(analogs_set) < 3:
+    
+    # Fallback: search for "аналог" results
+    if len(analogs_set) < CONFIG.min_analogs_before_ai:
         fallback_results = search_google(f"{item_name} аналог", 5)
         for r in fallback_results:
             title = r.get("title") or ""
@@ -759,27 +2074,28 @@ def collect_analogs(item_name: str, offers: list[LeasingOffer], use_ai: bool, an
     return [a for a in analogs_set if a]
 
 
-def fetch_listing_summaries(query: str, top_n: int = 3) -> list[dict]:
+def fetch_listing_summaries(query: str, top_n: int = 3) -> list[ListingSummary]:
+    """Fetch brief listing summaries for analog comparison."""
     results = search_google(query, num_results=top_n)
-    summaries = []
+    summaries: list[ListingSummary] = []
+    
     for r in results[:top_n]:
         title = r.get("title", "")
         snippet = r.get("snippet", "")
-        # Use smarter extraction
         price_guess = extract_price_candidate(title) or extract_price_candidate(snippet)
-        summaries.append(
-            {
+        summaries.append({
                 "title": title,
                 "link": r.get("link", ""),
                 "snippet": snippet,
                 "price_guess": price_guess,
-            }
-        )
+        })
     return summaries
 
 
 def analyze_market(item_name: str, offers: list[LeasingOffer], client_price: Optional[int]) -> dict:
+    """Perform market analysis on collected offers."""
     prices = [o.price for o in offers if o.price is not None]
+    
     result = {
         "item": item_name,
         "offers_used": [asdict(o) for o in offers],
@@ -791,31 +2107,75 @@ def analyze_market(item_name: str, offers: list[LeasingOffer], client_price: Opt
         "client_price_ok": None,
         "explanation": "",
     }
+    
     if not prices:
-        result["explanation"] = "Нет собранных цен."
+        result["explanation"] = "No prices collected."
         return result
 
     prices_sorted = sorted(prices)
     min_p, max_p = prices_sorted[0], prices_sorted[-1]
-    median_p = statistics.median(prices_sorted)
-    mean_p = round(statistics.mean(prices_sorted))
+    
+    # Safe calculation of median and mean to avoid OverflowError
+    try:
+        median_p = statistics.median(prices_sorted)
+        # Convert to int if it's a whole number to avoid float precision issues
+        if isinstance(median_p, float) and median_p.is_integer():
+            median_p = int(median_p)
+    except (OverflowError, ValueError) as e:
+        logger.warning(f"Error calculating median: {e}, using middle value")
+        # Fallback: use middle value
+        mid_idx = len(prices_sorted) // 2
+        median_p = prices_sorted[mid_idx] if len(prices_sorted) % 2 == 1 else (prices_sorted[mid_idx - 1] + prices_sorted[mid_idx]) // 2
+    
+    try:
+        # Calculate mean safely
+        total = sum(prices_sorted)
+        count = len(prices_sorted)
+        if count > 0:
+            mean_p = total // count  # Use integer division to avoid float
+            # If we need more precision, calculate remainder
+            remainder = total % count
+            if remainder > 0:
+                # Round to nearest integer
+                mean_p = round(total / count) if total < 10**15 else mean_p
+        else:
+            mean_p = 0
+    except (OverflowError, ValueError) as e:
+        logger.warning(f"Error calculating mean: {e}, using median")
+        mean_p = median_p if isinstance(median_p, (int, float)) else 0
 
     result["market_range"] = [min_p, max_p]
-    result["median_price"] = median_p
+    # Safe conversion to float
+    try:
+        if isinstance(median_p, int):
+            result["median_price"] = float(median_p) if median_p < 10**15 else median_p
+        else:
+            result["median_price"] = median_p
+    except OverflowError:
+        result["median_price"] = median_p  # Keep as int if too large
+    
     result["mean_price"] = mean_p
 
     if client_price is not None:
-        deviation = (client_price - median_p) / median_p * 100
-        ok = abs(deviation) <= 20  # 20% tolerance
-        result["client_price_ok"] = ok
-        verdict = "подтверждена" if ok else "не подтверждена"
-        result["explanation"] = (
-            f"Рыночный диапазон {format_price(min_p)} – {format_price(max_p)}, медиана {format_price(median_p)}. "
-            f"Цена клиента {format_price(client_price)} ({deviation:+.1f}%), {verdict}."
-        )
+        try:
+            deviation = (client_price - median_p) / median_p * 100
+            ok = abs(deviation) <= CONFIG.price_deviation_tolerance * 100
+            result["client_price_ok"] = ok
+            verdict = "confirmed" if ok else "not confirmed"
+            result["explanation"] = (
+                f"Market range {format_price(min_p)} – {format_price(max_p)}, median {format_price(median_p)}. "
+                f"Client price {format_price(client_price)} ({deviation:+.1f}%), {verdict}."
+            )
+        except (OverflowError, ZeroDivisionError) as e:
+            logger.warning(f"Error calculating deviation: {e}")
+            result["client_price_ok"] = None
+            result["explanation"] = (
+                f"Market range {format_price(min_p)} – {format_price(max_p)}, median {format_price(median_p)}. "
+                f"Client price {format_price(client_price)}."
+            )
     else:
         result["explanation"] = (
-            f"Рыночный диапазон {format_price(min_p)} – {format_price(max_p)}, медиана {format_price(median_p)}."
+            f"Market range {format_price(min_p)} – {format_price(max_p)}, median {format_price(median_p)}."
         )
 
     return result
@@ -825,157 +2185,396 @@ def analyze_market(item_name: str, offers: list[LeasingOffer], client_price: Opt
 # Pipeline
 # =============================
 def extract_model_from_query(query: str) -> str:
+    """Extract model name (first two words) from query."""
     parts = query.split()
     return " ".join(parts[:2]) if parts else ""
+
+
+def _process_single_url(
+    result: dict,
+    model_name: str,
+    fetcher: SeleniumFetcher,
+    parser: ParserStrategy,
+    idx: int,
+    total: int
+) -> list[LeasingOffer]:
+    """Process a single URL and return offers."""
+    url = result.get("link", "")
+    title = result.get("title", "")
+    
+    if not is_valid_url(url):
+        logger.debug(f"[{idx}/{total}] Invalid URL: {url}")
+        return []
+    
+    domain = urlparse(url).netloc.replace("www.", "")
+    logger.debug(f"[{idx}/{total}] Processing {domain} | {url}")
+    
+    # Fetch page
+    is_avito = CONFIG.avito_domain in domain
+    scroll_times = CONFIG.avito_scroll_times if is_avito else CONFIG.other_scroll_times
+    html = fetcher.fetch_page(url, scroll_times=scroll_times, wait=CONFIG.scroll_wait)
+    
+    if not html:
+        logger.debug(f"[{idx}/{total}] Failed to load {url}")
+        return []
+    
+    # Parse using strategy
+    try:
+        offers = parser.parse(html, url, model_name, title)
+        if offers:
+            logger.debug(f"[{idx}/{total}] Found {len(offers)} offers from {domain}")
+        return offers
+    except Exception as e:
+        logger.warning(f"[{idx}/{total}] Error parsing {url}: {e}")
+        return []
 
 
 def search_and_analyze(
     query: str,
     fetcher: SeleniumFetcher,
-    analyzer: Optional[LeasingAssetAnalyzer],
+    analyzer: Optional[AIAnalyzer],
     num_results: int = 5,
     use_ai: bool = True,
 ) -> list[LeasingOffer]:
-    print("\n" + "=" * 70)
-    print(f"Поисковый запрос: {query}")
-    print("=" * 70)
+    """Main search and analysis pipeline with parallel processing."""
+    logger.info("=" * 70)
+    logger.info(f"Search query: {query}")
+    logger.info("=" * 70)
 
     model_name = extract_model_from_query(query)
     mandatory_urls = generate_mandatory_urls(model_name)
-    print(f"[*] Обязательные источники: {len(mandatory_urls)}")
+    logger.info(f"Mandatory sources: {len(mandatory_urls)}")
 
     search_results = search_google(query, num_results * 2)
-    filtered_google = filter_search_results(search_results, num_results) if search_results else []
+    if not search_results:
+        logger.warning(f"No Google results for query: {query}")
+        filtered_google = []
+    else:
+        filtered_google = filter_search_results(search_results, num_results)
 
     all_results = merge_with_mandatory(filtered_google, mandatory_urls)
-    print(f"[*] Всего URL: {len(all_results)}")
+    logger.info(f"Total URLs: {len(all_results)}")
+
+    if not all_results:
+        logger.warning("No URLs to process")
+        return []
+
+    # Create parser strategies
+    avito_parser = AvitoParserStrategy()
+    generic_parser = GenericParserStrategy(analyzer, use_ai)
 
     offers: list[LeasingOffer] = []
+    
+    # Process URLs in parallel
+    with ThreadPoolExecutor(max_workers=CONFIG.max_workers) as executor:
+        futures = {}
+        
+        for idx, result in enumerate(all_results, 1):
+            url = result.get("link", "")
+            domain = urlparse(url).netloc.replace("www.", "")
+            is_avito = CONFIG.avito_domain in domain
+            
+            # Choose parser strategy
+            parser = avito_parser if is_avito else generic_parser
+            
+            # Submit task
+            future = executor.submit(
+                _process_single_url,
+                result,
+                model_name,
+                fetcher,
+                parser,
+                idx,
+                len(all_results)
+            )
+            futures[future] = (idx, url)
+        
+        # Collect results with progress bar
+        with tqdm(total=len(futures), desc="Processing URLs", unit="url") as pbar:
+            for future in as_completed(futures):
+                idx, url = futures[future]
+                try:
+                    url_offers = future.result()
+                    offers.extend(url_offers)
+                except Exception as e:
+                    logger.error(f"Error processing {url}: {e}")
+                finally:
+                    pbar.update(1)
 
-    for idx, result in enumerate(all_results, 1):
-        url = result.get("link", "")
-        title = result.get("title", "")
-        domain = urlparse(url).netloc.replace("www.", "")
-        is_avito = "avito.ru" in domain
-
-        print(f"\n[{idx}/{len(all_results)}] {domain} | {url}")
-
-        # Fetch page with tuned scroll depth
-        scroll_times = 2 if is_avito else 3
-        html = fetcher.fetch_page(url, scroll_times=scroll_times, wait=1.5)
-        if not html:
-            print("    [!] Не удалось загрузить страницу")
-            continue
-
-        if is_avito:
-            avito_offers = parse_avito_list_page(html, model_name)
-            print(f"    Объявлений Avito: {len(avito_offers)}")
-            offers.extend(avito_offers)
-            continue  # no AI for Avito list pages
-
-        # Basic parsing
-        basic = parse_page_basic(html, model_name)
-
-        ai_result = None
-        if use_ai and analyzer:
-            text = analyzer.clean_content(html)
-            ai_result = analyzer.analyze_with_ai(text)
-
-        merged = basic.copy()
-        if ai_result:
-            for k, v in ai_result.items():
-                if v is not None:
-                    merged[k] = v
-
-        if not merged:
-            print("    [!] Нет структурированных данных")
-            continue
-
-        offer = LeasingOffer(
-            title=title or result.get("title", "Объявление"),
-            url=url,
-            source=domain,
-            model=model_name,
-            price=merged.get("price"),
-            price_str=format_price(merged.get("price")),
-            monthly_payment=merged.get("monthly_payment"),
-            monthly_payment_str=format_price(merged.get("monthly_payment")),
-            price_on_request=merged.get("price_on_request", False),
-            year=merged.get("year"),
-            power=merged.get("power"),
-            mileage=merged.get("mileage"),
-            vendor=merged.get("vendor"),
-            condition=merged.get("condition"),
-            location=merged.get("location"),
-            specs=merged.get("specs", {}),
-            category=merged.get("category"),
-            currency=merged.get("currency"),
-            pros=ensure_list_str(merged.get("pros")),
-            cons=ensure_list_str(merged.get("cons")),
-            analogs=ensure_list_str(merged.get("analogs_mentioned")),
-        )
-        if offer.has_data():
-            offers.append(offer)
-
+    # Deduplicate and filter outliers
+    # Apply filters in order: quality -> deduplication -> outliers
+    offers = filter_low_quality_offers(offers)
+    offers = deduplicate_offers(offers)
     offers = filter_price_outliers(offers)
+    
+    logger.info(f"Total offers after processing: {len(offers)}")
     return offers
 
 
+# =============================
+# Output formatting
+# =============================
+def print_offer(idx: int, o: LeasingOffer):
+    """Print single offer details."""
+    print(f"\n[{idx}] {o.title}")
+    print(f"    Source: {o.source}")
+    print(f"    Model: {o.model}")
+    if o.category:
+        print(f"    Category: {o.category}")
+    print(f"    URL: {o.url}")
+    
+    if o.price_str or o.monthly_payment_str or o.price_on_request:
+        print("    --- Pricing ---")
+        if o.price_on_request and not o.price:
+            print("    Price on request")
+        if o.price_str:
+            if o.currency and o.currency.upper() != "RUB":
+                print(f"    Price: {o.price_str} ({o.currency})")
+            else:
+                print(f"    Price: {o.price_str}")
+        if o.monthly_payment_str:
+            print(f"    Monthly payment: {o.monthly_payment_str}")
+    
+    if any([o.year, o.power, o.mileage, o.vendor, o.condition, o.location]):
+        print("    --- Specifications ---")
+        if o.vendor:
+            print(f"    Vendor: {o.vendor}")
+        if o.year:
+            print(f"    Year: {o.year}")
+        if o.condition:
+            print(f"    Condition: {o.condition}")
+        if o.power:
+            print(f"    Power: {o.power}")
+        if o.mileage:
+            print(f"    Mileage: {o.mileage}")
+        if o.location:
+            print(f"    Location: {o.location}")
+    
+    if o.specs:
+        print("    --- Additional specs ---")
+        for k, v in o.specs.items():
+            print(f"    {k}: {v}")
+    
+    if o.pros:
+        print("    --- Pros ---")
+        for p in o.pros:
+            print(f"    + {p}")
+    
+    if o.cons:
+        print("    --- Cons ---")
+        for c in o.cons:
+            print(f"    - {c}")
+    
+    if o.analogs:
+        print("    --- Mentioned analogs ---")
+        for a in o.analogs:
+            print(f"    • {a}")
+
+
 def print_results(offers: list[LeasingOffer]):
+    """Print all results."""
     print("\n" + "=" * 70)
-    print(f"Найдено предложений: {len(offers)}")
+    print(f"Found offers: {len(offers)}")
     print("=" * 70)
     for i, o in enumerate(offers, 1):
-        print(f"\n[{i}] {o.title}")
-        print(f"    Источник: {o.source}")
-        print(f"    Модель: {o.model}")
-        if o.category:
-            print(f"    Категория: {o.category}")
-        print(f"    URL: {o.url}")
-        if o.price_str or o.monthly_payment_str or o.price_on_request:
-            print("    --- Ценообразование ---")
-            if o.price_on_request and not o.price:
-                print("    Цена по запросу")
-            if o.price_str:
-                if o.currency and o.currency.upper() != "RUB":
-                    print(f"    Цена: {o.price_str} ({o.currency})")
-                else:
-                    print(f"    Цена: {o.price_str}")
-            if o.monthly_payment_str:
-                print(f"    Месячный платеж: {o.monthly_payment_str}")
-        if any([o.year, o.power, o.mileage, o.vendor, o.condition, o.location]):
-            print("    --- Характеристики ---")
-            if o.vendor:
-                print(f"    Производитель: {o.vendor}")
-            if o.year:
-                print(f"    Год: {o.year}")
-            if o.condition:
-                print(f"    Состояние: {o.condition}")
-            if o.power:
-                print(f"    Мощность: {o.power}")
-            if o.mileage:
-                print(f"    Пробег: {o.mileage}")
-            if o.location:
-                print(f"    Локация: {o.location}")
-        if o.specs:
-            print("    --- Доп. параметры ---")
-            for k, v in o.specs.items():
-                print(f"    {k}: {v}")
-        if o.pros:
-            print("    --- Плюсы ---")
-            for p in o.pros:
-                print(f"    + {p}")
-        if o.cons:
-            print("    --- Минусы ---")
-            for c in o.cons:
-                print(f"    - {c}")
-        if o.analogs:
-            print("    --- Упомянутые аналоги ---")
-            for a in o.analogs:
-                print(f"    • {a}")
+        print_offer(i, o)
+
+
+def print_analog_details(analog_details: list[dict]):
+    """Print analog comparison details."""
+    print("\nAnalog comparison:")
+    for a in analog_details:
+        p_est = a.get("avg_price_guess")
+        print(f"--- {a['name']} ---")
+        print(f"  Price ~ {format_price(p_est) if p_est else 'No data'}")
+        if a.get('note'):
+            print(f"  Note: {a['note']}")
+        if a['pros']:
+            print(f"  [+] {', '.join(a['pros'])}")
+        if a['cons']:
+            print(f"  [-] {', '.join(a['cons'])}")
+        
+        # Print sources
+        print("  Sources:")
+        printed_links = set()
+        if a.get("best_link"):
+            print(f"    [Recommended] {a['best_link']}")
+            printed_links.add(a['best_link'])
+        
+        if a.get("listings"):
+            for l in a["listings"]:
+                lnk = l.get('link', '')
+                if lnk and lnk not in printed_links:
+                    print(f"    {l.get('title', 'Link')}: {lnk}")
+
+
+def print_best_offer_analysis(best_offer: Optional[LeasingOffer], analysis: dict, item_name: str):
+    """Print analysis of the best offer."""
+    if not best_offer:
+        return
+    
+    print("\n" + "=" * 70)
+    print(f"🏆 BEST OFFER: {item_name}")
+    print("=" * 70)
+    
+    print(f"\n📋 {best_offer.title}")
+    print(f"   URL: {best_offer.url}")
+    print(f"   Source: {best_offer.source}")
+    
+    if best_offer.price_str:
+        print(f"   💰 Price: {best_offer.price_str}")
+    if best_offer.year:
+        print(f"   📅 Year: {best_offer.year}")
+    if best_offer.condition:
+        print(f"   ⚙️  Condition: {best_offer.condition}")
+    if best_offer.location:
+        print(f"   📍 Location: {best_offer.location}")
+    
+    score = analysis.get("best_score", 0)
+    reason = analysis.get("reason", "")
+    print(f"\n   ⭐ Score: {score:.1f}/10")
+    if reason:
+        print(f"   💡 Reason: {reason}")
+    
+    ranking = analysis.get("ranking", [])
+    if ranking and len(ranking) > 1:
+        print(f"\n   📊 Ranking of all offers:")
+        for rank in ranking[:5]:  # Top 5
+            idx = rank.get("index", 0)
+            score_r = rank.get("score", 0)
+            brief = rank.get("brief_reason", "")
+            print(f"      {idx+1}. Score {score_r:.1f}/10 - {brief}")
+
+
+def print_best_offers_comparison(comparisons: dict, original_name: str):
+    """Print comparison between best original and best analog offers."""
+    if not comparisons:
+        return
+    
+    print("\n" + "=" * 70)
+    print("⚖️  COMPARISON: Best Original vs Best Analogs")
+    print("=" * 70)
+    
+    for analog_name, comparison in comparisons.items():
+        print(f"\n{'─' * 60}")
+        print(f"Original: {original_name}")
+        print(f"Analog: {analog_name}")
+        print(f"{'─' * 60}")
+        
+        winner = comparison.get("winner", "original")
+        orig_score = comparison.get("original_score", 0)
+        analog_score = comparison.get("analog_score", 0)
+        
+        if winner == "original":
+            print(f"🏆 Winner: ORIGINAL ({orig_score:.1f}/10 vs {analog_score:.1f}/10)")
+        else:
+            print(f"🏆 Winner: ANALOG ({analog_score:.1f}/10 vs {orig_score:.1f}/10)")
+        
+        # Price comparison
+        price_comp = comparison.get("price_comparison", {})
+        if price_comp:
+            orig_price = price_comp.get("original_price")
+            analog_price = price_comp.get("analog_price")
+            diff = price_comp.get("difference_percent", 0)
+            verdict = price_comp.get("price_verdict", "similar")
+            
+            print(f"\n💰 Price Comparison:")
+            print(f"   Original: {format_price(orig_price)}")
+            print(f"   Analog: {format_price(analog_price)}")
+            if diff != 0:
+                print(f"   Difference: {diff:+.1f}% ({verdict})")
+        
+        # Pros and cons
+        pros_orig = comparison.get("pros_original", [])
+        cons_orig = comparison.get("cons_original", [])
+        pros_analog = comparison.get("pros_analog", [])
+        cons_analog = comparison.get("cons_analog", [])
+        
+        if pros_orig:
+            print(f"\n✅ Original Advantages:")
+            for p in pros_orig[:3]:
+                print(f"   + {p}")
+        
+        if cons_orig:
+            print(f"\n❌ Original Disadvantages:")
+            for c in cons_orig[:3]:
+                print(f"   - {c}")
+        
+        if pros_analog:
+            print(f"\n✅ Analog Advantages:")
+            for p in pros_analog[:3]:
+                print(f"   + {p}")
+        
+        if cons_analog:
+            print(f"\n❌ Analog Disadvantages:")
+            for c in cons_analog[:3]:
+                print(f"   - {c}")
+        
+        # Recommendation
+        recommendation = comparison.get("recommendation", "")
+        if recommendation:
+            print(f"\n💡 Recommendation:")
+            print(f"   {recommendation}")
+        
+        # Use cases
+        use_cases_orig = comparison.get("use_cases_original", [])
+        use_cases_analog = comparison.get("use_cases_analog", [])
+        
+        if use_cases_orig:
+            print(f"\n📌 When to choose Original:")
+            for uc in use_cases_orig[:2]:
+                print(f"   • {uc}")
+        
+        if use_cases_analog:
+            print(f"\n📌 When to choose Analog:")
+            for uc in use_cases_analog[:2]:
+                print(f"   • {uc}")
+
+
+def print_final_report(report: dict, client_price: Optional[int], analog_details: list[dict]):
+    """Print final market report with deep analysis."""
+    print("\n" + "=" * 70)
+    print("FINAL REPORT")
+    print("=" * 70)
+    
+    if report["market_range"]:
+        min_p, max_p = report["market_range"]
+        print(f"Market range: {format_price(min_p)} – {format_price(max_p)}")
+        print(f"Median: {format_price(report['median_price'])}")
+    
+    if client_price:
+        status = "OK" if report.get("client_price_ok") else "Deviation > 20%"
+        print(f"Client price: {format_price(client_price)} -> {status}")
+    
+    print(f"Comment: {report['explanation']}")
+    
+    if report.get("ai_flag"):
+        print(f"WARNING: {report.get('ai_comment')}")
+    
+    # Print best original offer analysis
+    best_original = report.get("best_original_offer")
+    best_original_analysis = report.get("best_original_analysis", {})
+    if best_original:
+        item_name = report.get("item", "Unknown")
+        # Convert dict to LeasingOffer if needed
+        if isinstance(best_original, dict):
+            best_offer_obj = LeasingOffer(**best_original)
+        else:
+            best_offer_obj = best_original
+        print_best_offer_analysis(best_offer_obj, best_original_analysis, item_name)
+    
+    # Print comparison with analogs
+    comparisons = report.get("best_offers_comparison", {})
+    if comparisons:
+        original_name = report.get("item", "Unknown")
+        print_best_offers_comparison(comparisons, original_name)
+
+    if analog_details:
+        print_analog_details(analog_details)
 
 
 def save_results_json(offers: list[LeasingOffer], item_name: str = "results", market_report: Optional[dict] = None):
+    """Save results to JSON file."""
     safe_name = "".join(c if c.isalnum() or c in " _-" else "_" for c in item_name)
     filename = f"{safe_name}.json"
     data = {"offers": [asdict(o) for o in offers]}
@@ -983,54 +2582,224 @@ def save_results_json(offers: list[LeasingOffer], item_name: str = "results", ma
         data["market_report"] = market_report
     with open(filename, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-    print(f"\n[*] JSON сохранен в {filename}")
+    logger.info(f"JSON saved to {filename}")
 
 
 # =============================
-# CLI
+# User input handling
 # =============================
-def main():
+def get_user_input() -> UserInput:
+    """Get and validate user input."""
     print("=" * 70)
-    print("Анализатор рыночной стоимости предмета лизинга (Avito + AI)")
+    print("Leasing Asset Market Analyzer (Avito + AI)")
     print("=" * 70)
 
-    item = input("\nВведите предмет лизинга (например, BMW M5 2024): ").strip()
+    item = input("\nEnter leasing item (e.g., BMW M5 2024): ").strip()
     if not item:
-        print("[!] Пустой запрос, выходим.")
-        return
+        raise ValueError("Empty query")
 
-    client_price_input = input("Цена клиента (только цифры, опционально): ").strip()
+    client_price_input = input("Client price (digits only, optional): ").strip()
     client_price = digits_to_int(client_price_input) if client_price_input else None
 
-    # Ask for AI usage. Default: Y
-    use_ai_str = input("Использовать AI для анализа (y/n, default y): ").strip().lower()
+    use_ai_str = input("Use AI for analysis (y/n, default y): ").strip().lower()
     use_ai = use_ai_str != "n"
 
-    num_input = input("Сколько результатов искать (default 5): ").strip()
-    num_results = int(num_input) if num_input.isdigit() else 5
+    num_input = input("Number of results to search (default 5): ").strip()
+    num_results = int(num_input) if num_input.isdigit() else CONFIG.default_num_results
 
-    # Lifecycle management
+    return {
+        "item": item,
+        "client_price": client_price,
+        "use_ai": use_ai,
+        "num_results": num_results,
+    }
+
+
+# =============================
+# Deep offer comparison
+# =============================
+def find_best_offer_from_list(
+    offers: list[LeasingOffer],
+    analyzer: Optional[AIAnalyzer],
+    use_ai: bool,
+    item_name: str
+) -> tuple[Optional[LeasingOffer], dict]:
+    """
+    Find the best offer from a list by comparing all offers with each other.
+    
+    Returns:
+        Tuple of (best_offer, comparison_result)
+    """
+    if not offers:
+        return None, {}
+    
+    if len(offers) == 1:
+        return offers[0], {"best_index": 0, "best_score": 8.0, "reason": "Only one offer"}
+    
+    if not use_ai or not analyzer:
+        # Fallback: return offer with lowest price (if available)
+        priced_offers = [o for o in offers if o.price is not None]
+        if priced_offers:
+            best = min(priced_offers, key=lambda x: x.price)
+            return best, {"best_index": offers.index(best), "best_score": 7.0, "reason": "Lowest price (no AI)"}
+        return offers[0], {"best_index": 0, "best_score": 5.0, "reason": "First offer (no AI, no prices)"}
+    
+    logger.info(f"Comparing {len(offers)} offers to find the best one...")
+    
+    # Convert offers to dict format for AI
+    offers_dict = [asdict(o) for o in offers]
+    
+    # Find best offer using AI
+    result = analyzer.find_best_offer(offers_dict)
+    
+    best_index = result.get("best_index", 0)
+    if 0 <= best_index < len(offers):
+        best_offer = offers[best_index]
+        logger.info(f"Best offer selected: {best_offer.title[:50]}... (score: {result.get('best_score', 0):.1f}/10)")
+        return best_offer, result
+    else:
+        logger.warning(f"Invalid best_index {best_index}, using first offer")
+        return offers[0], result
+
+
+def compare_best_offers_original_vs_analogs(
+    best_original: Optional[LeasingOffer],
+    best_analogs: list[tuple[str, Optional[LeasingOffer]]],  # [(analog_name, best_offer), ...]
+    original_name: str,
+    analyzer: Optional[AIAnalyzer],
+    use_ai: bool
+) -> dict:
+    """
+    Compare best original offer with best analog offers.
+    
+    Returns:
+        Dictionary with comparison results for each analog
+    """
+    if not best_original:
+        return {}
+    
+    if not best_analogs:
+        return {}
+    
+    comparisons = {}
+    
+    for analog_name, best_analog in best_analogs:
+        if not best_analog:
+            continue
+        
+        if not use_ai or not analyzer:
+            # Simple price comparison
+            orig_price = best_original.price or 0
+            analog_price = best_analog.price or 0
+            if orig_price and analog_price:
+                diff = ((analog_price - orig_price) / orig_price) * 100
+                comparisons[analog_name] = {
+                    "winner": "original" if abs(diff) < 5 else ("analog" if diff < -5 else "original"),
+                    "price_comparison": {
+                        "original_price": orig_price,
+                        "analog_price": analog_price,
+                        "difference_percent": diff,
+                        "price_verdict": "analog_cheaper" if diff < -5 else ("original_cheaper" if diff > 5 else "similar")
+                    },
+                    "recommendation": f"Price difference: {diff:+.1f}%"
+                }
+            continue
+        
+        logger.info(f"Comparing best original with best {analog_name}...")
+        
+        original_dict = asdict(best_original)
+        analog_dict = asdict(best_analog)
+        
+        comparison = analyzer.compare_best_offers(
+            best_original=original_dict,
+            best_analog=analog_dict,
+            original_name=original_name,
+            analog_name=analog_name
+        )
+        
+        # Add URLs to comparison result
+        if comparison:
+            comparison["original_url"] = best_original.url
+            comparison["analog_url"] = best_analog.url
+            comparison["original_title"] = best_original.title
+            comparison["analog_title"] = best_analog.title
+        
+        comparisons[analog_name] = comparison
+    
+    return comparisons
+
+
+# =============================
+# Main pipeline execution
+# =============================
+def run_pipeline(params: UserInput) -> tuple[list[LeasingOffer], dict, list[dict]]:
+    """Execute the main analysis pipeline."""
+    item = params["item"]
+    client_price = params["client_price"]
+    use_ai = params["use_ai"]
+    num_results = params["num_results"]
+    
+    # Initialize components
     fetcher = SeleniumFetcher()
-    analyzer = LeasingAssetAnalyzer(GIGACHAT_AUTH_DATA, fetcher) if use_ai else None
+    cleaner = ContentCleaner()
+    
+    analyzer = None
+    if use_ai and CONFIG.gigachat_auth_data:
+        client = GigaChatClient(CONFIG.gigachat_auth_data)
+        analyzer = AIAnalyzer(client, cleaner)
 
     try:
-        query = f"{item} лизинг"
+        query = f"{item} {CONFIG.default_search_suffix}"
         offers = search_and_analyze(query, fetcher, analyzer, num_results=num_results, use_ai=use_ai)
         
         # Retry logic if empty
         if not offers:
-            print("\n[!] Прямой поиск не дал результатов, пробуем упростить запрос...")
-            # Try searching just the item name
-            query_simple = f"{item} купить"
+            logger.warning("Direct search returned no results, trying simpler query...")
+            query_simple = f"{item} {CONFIG.fallback_search_suffix}"
             offers = search_and_analyze(query_simple, fetcher, analyzer, num_results=num_results, use_ai=use_ai)
         
         if not offers:
-            print("\n[!] Не удалось извлечь предложения даже после повторной попытки.")
-            return
+            logger.error("Could not extract offers even after retry")
+            return [], {}, []
 
-        print_results(offers)
-        
-        # Analogs
+        # =============================
+        # ENRICH WITH SPECS FROM SPECIALIZED SITES
+        # =============================
+        if use_ai and analyzer:
+            logger.info("=" * 70)
+            logger.info("Enriching offers with technical specifications...")
+            logger.info("=" * 70)
+            
+            # Extract specs for the main item
+            item_specs = extract_specs_from_multiple_sites(
+                item_name=item,
+                fetcher=fetcher,
+                analyzer=analyzer,
+                num_sites=5
+            )
+            
+            # Enrich offers with specs if they don't have enough
+            if item_specs:
+                logger.info(f"Extracted {len(item_specs)} specifications, enriching offers...")
+                enriched_count = 0
+                for offer in offers:
+                    # Merge specs: prioritize existing, add missing from item_specs
+                    if len(offer.specs) < 3:  # If offer has less than 3 specs, enrich it
+                        # Add missing specs
+                        added_count = 0
+                        for key, value in item_specs.items():
+                            if key not in offer.specs and value:
+                                offer.specs[key] = value
+                                added_count += 1
+                        
+                        if added_count > 0:
+                            enriched_count += 1
+                            logger.debug(f"Enriched offer '{offer.title[:50]}...' with {added_count} new specs (total: {len(offer.specs)})")
+                
+                if enriched_count > 0:
+                    logger.info(f"Enriched {enriched_count} offers with technical specifications")
+
+        # Collect analogs
         analogs = collect_analogs(item, offers, use_ai=use_ai, analyzer=analyzer)
         
         # Generate initial report
@@ -1039,20 +2808,69 @@ def main():
 
         # Validate with AI
         if use_ai and analyzer and report["median_price"]:
-            print("\n[*] Проверка отчета через AI...")
+            logger.info("Validating report with AI...")
             validation = analyzer.validate_report(report)
             if not validation.get("is_valid"):
-                print(f"[WARN] AI считает отчет подозрительным: {validation.get('comment')}")
+                logger.warning(f"AI flagged report as suspicious: {validation.get('comment')}")
                 report["ai_flag"] = "SUSPICIOUS"
                 report["ai_comment"] = validation.get("comment")
             else:
-                print("[*] AI подтверждает корректность оценки.")
+                logger.info("AI confirmed report validity")
 
-        # Analogs deep dive
+        # =============================
+        # DEEP ANALYSIS: Find best original offer
+        # =============================
+        best_original_offer = None
+        best_original_analysis = {}
+        
+        if use_ai and analyzer and offers:
+            logger.info("=" * 70)
+            logger.info("DEEP ANALYSIS: Comparing original offers to find the best one...")
+            logger.info("=" * 70)
+            best_original_offer, best_original_analysis = find_best_offer_from_list(
+                offers=offers,
+                analyzer=analyzer,
+                use_ai=use_ai,
+                item_name=item
+            )
+            report["best_original_offer"] = asdict(best_original_offer) if best_original_offer else None
+            report["best_original_analysis"] = best_original_analysis
+        
+        # =============================
+        # Analog deep dive
+        # =============================
         analog_details = []
+        best_analog_offers: list[tuple[str, Optional[LeasingOffer]]] = []
+        
         if analogs:
-            print("\n[*] Сбор данных по аналогам...")
+            logger.info("Collecting analog data...")
             for analog in analogs:
+                # Search for analog offers
+                query_analog = f"{analog} {CONFIG.fallback_search_suffix}"
+                analog_offers = search_and_analyze(
+                    query_analog,
+                    fetcher,
+                    analyzer,
+                    num_results=3,  # Fewer for analogs
+                    use_ai=use_ai
+                )
+                
+                # Find best analog offer
+                best_analog_offer = None
+                best_analog_analysis = {}
+                
+                if analog_offers and use_ai and analyzer:
+                    logger.info(f"Comparing {len(analog_offers)} offers for analog '{analog}'...")
+                    best_analog_offer, best_analog_analysis = find_best_offer_from_list(
+                        offers=analog_offers,
+                        analyzer=analyzer,
+                        use_ai=use_ai,
+                        item_name=analog
+                    )
+                
+                best_analog_offers.append((analog, best_analog_offer))
+                
+                # Legacy analog details (for compatibility)
                 listings = fetch_listing_summaries(f"{analog} купить", top_n=3)
                 price_list = [l["price_guess"] for l in listings if l.get("price_guess")]
                 avg_price_math = int(sum(price_list) / len(price_list)) if price_list else None
@@ -1069,11 +2887,11 @@ def main():
                     note = ai_review.get("note", "")
                     best_link = ai_review.get("best_link")
                 
-                # Prioritize AI price hint if available and reasonable, else math
                 final_price = price_hint if price_hint else avg_price_math
+                if best_analog_offer and best_analog_offer.price:
+                    final_price = best_analog_offer.price
 
-                analog_details.append(
-                    {
+                analog_details.append({
                         "name": analog,
                         "listings": listings,
                         "avg_price_guess": final_price,
@@ -1081,99 +2899,130 @@ def main():
                         "pros": pros,
                         "cons": cons,
                         "note": note,
-                        "best_link": best_link
-                    }
-                )
+                    "best_link": best_link,
+                    "best_offer": asdict(best_analog_offer) if best_analog_offer else None,
+                    "best_offer_analysis": best_analog_analysis
+                })
 
         report["analogs_details"] = analog_details
 
-        # Final print
-        print("\n" + "=" * 70)
-        print("ИТОГОВЫЙ ОТЧЕТ")
-        print("=" * 70)
-        if report["market_range"]:
-             min_p, max_p = report["market_range"]
-             print(f"Диапазон рынка: {format_price(min_p)} – {format_price(max_p)}")
-             print(f"Медиана: {format_price(report['median_price'])}")
+        # =============================
+        # DEEP ANALYSIS: Compare best original vs best analogs
+        # =============================
+        if best_original_offer and best_analog_offers and use_ai and analyzer:
+            logger.info("=" * 70)
+            logger.info("DEEP ANALYSIS: Comparing best original with best analogs...")
+            logger.info("=" * 70)
+            
+            comparisons = compare_best_offers_original_vs_analogs(
+                best_original=best_original_offer,
+                best_analogs=best_analog_offers,
+                original_name=item,
+                analyzer=analyzer,
+                use_ai=use_ai
+            )
+            
+            report["best_offers_comparison"] = comparisons
         
-        if client_price:
-            status = "OK" if report.get("client_price_ok") else "Deviation > 20%"
-            print(f"Цена клиента: {format_price(client_price)} -> {status}")
-        
-        print(f"Комментарий (стат): {report['explanation']}")
-        
-        if report.get("ai_flag"):
-            print(f"WARNING: {report.get('ai_comment')}")
-
-        if analog_details:
-            print("\nСравнение с аналогами:")
-            for a in analog_details:
-                p_est = a.get("avg_price_guess")
-                print(f"--- {a['name']} ---")
-                print(f"  Цена ~ {format_price(p_est) if p_est else 'Нет данных'}")
-                if a.get('note'): print(f"  Заметка: {a['note']}")
-                if a['pros']: print(f"  [+] {', '.join(a['pros'])}")
-                if a['cons']: print(f"  [-] {', '.join(a['cons'])}")
-                
-                # Print sources clearly
-                print("  Источники:")
-                printed_links = set()
-                # If AI highlighted a best link, show it first
-                if a.get("best_link"):
-                    print(f"    [Реком.] {a['best_link']}")
-                    printed_links.add(a['best_link'])
-                
-                # Show other listings
-                if a.get("listings"):
-                    for l in a["listings"]:
-                        lnk = l.get('link','')
-                        if lnk and lnk not in printed_links:
-                            print(f"    {l.get('title','Link')}: {lnk}")
-
-        save_input = input("\nСохранить результаты в JSON? (y/n): ").strip().lower()
-        if save_input == "y":
-            save_results_json(offers, item, market_report=report)
+        return offers, report, analog_details
 
     finally:
-        if fetcher:
-            fetcher.close()
+        fetcher.close()
+
+
+# =============================
+# CLI
+# =============================
+def main():
+    """Main CLI entry point."""
+    try:
+        params = get_user_input()
+    except ValueError as e:
+        logger.error(f"Invalid input: {e}")
+        return
+
+    offers, report, analog_details = run_pipeline(params)
+    
+    if not offers:
+        return
+
+    print_results(offers)
+    print_final_report(report, params["client_price"], analog_details)
+
+    save_input = input("\nSave results to JSON? (y/n): ").strip().lower()
+    if save_input == "y":
+        save_results_json(offers, params["item"], market_report=report)
+
 
 # =============================
 # Entry point for API
 # =============================
-
 def run_analysis(
     item: str,
     client_price: int | None = None,
     use_ai: bool = True,
     num_results: int = 5,
 ) -> dict:
-    fetcher = SeleniumFetcher()
-    analyzer = LeasingAssetAnalyzer(GIGACHAT_AUTH_DATA, fetcher) if use_ai else None
-
-    try:
-        query = f"{item} лизинг"
-
-        offers = search_and_analyze(
-            query,        # 1) строка запроса
-            fetcher,      # 2) SeleniumFetcher
-            analyzer,     # 3) анализатор или None
-            num_results=num_results,
-            use_ai=use_ai,
-        )
-
-        report = analyze_market(item, offers, client_price)
-        return {
-            "item": item,
-            "offers_used": [asdict(o) for o in offers],
-            "analogs_suggested": collect_analogs(item, offers, use_ai, analyzer),
-            "analogs_details": [],        # если у тебя ниже не добавляется что‑то ещё
-            "market_report": report,
-        }
-    finally:
-        fetcher.close()
-
+    """
+    API entry point for running analysis programmatically.
+    
+    Args:
+        item: Item to analyze (e.g., "BMW M5 2024")
+        client_price: Optional client's expected price
+        use_ai: Whether to use AI analysis
+        num_results: Number of search results to process
+    
+    Returns:
+        Dictionary with analysis results
+    """
+    params: UserInput = {
+        "item": item,
+        "client_price": client_price,
+        "use_ai": use_ai,
+        "num_results": num_results,
+    }
+    
+    offers, report, analog_details = run_pipeline(params)
+    
+    return {
+        "item": item,
+        "offers_used": [asdict(o) for o in offers],
+        "analogs_suggested": report.get("analogs_suggested", []),
+        "analogs_details": analog_details,
+        "market_report": report,
+    }
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    
+    # Check if running as web server or CLI
+    if len(sys.argv) > 1 and sys.argv[1] == "--web":
+        # Run as web server
+        try:
+            import uvicorn
+            import os
+            import sys as sys_module
+            
+            # Add parent directory to path for imports
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            if current_dir not in sys_module.path:
+                sys_module.path.insert(0, current_dir)
+            
+            print("=" * 70)
+            print("🚀 Starting Leasing Analyzer Web Server")
+            print("=" * 70)
+            print("📱 Open http://localhost:8000 in your browser")
+            print("=" * 70)
+            print("Press Ctrl+C to stop")
+            print("=" * 70)
+            
+            # Run from root directory, import will work
+            uvicorn.run("api.main:app", host="0.0.0.0", port=8000, reload=True)
+        except ImportError as e:
+            print("❌ Error: uvicorn not installed. Run: pip install uvicorn")
+            print(f"   Details: {e}")
+            sys.exit(1)
+    else:
+        # Run as CLI
+        main()

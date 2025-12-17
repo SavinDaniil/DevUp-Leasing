@@ -81,7 +81,7 @@
     <!-- Правая панель: результат -->
     <div class="right-panel">
         <div id="resultContent" class="result-content">
-            <h2>Здесь будет результат анализа</h2>
+            <h2 id="resultTitle">Здесь будет результат анализа</h2>
 
             <div class="metrics-grid">
                 <div class="metric">
@@ -106,6 +106,22 @@
             📂 Заполните форму слева, чтобы увидеть анализ.
         </div>
 
+        <!-- Best Original Offer Section -->
+        <div id="bestOriginalSection" class="best-offer-section hidden">
+            <h3>🏆 Лучшее объявление оригинала</h3>
+            <div id="bestOriginalCard" class="best-offer-card">
+                <!-- Will be filled by JS -->
+            </div>
+        </div>
+
+        <!-- Best Offers Comparison Section -->
+        <div id="bestComparisonSection" class="comparison-section hidden">
+            <h3>⚖️ Сравнение лучших объявлений</h3>
+            <div id="bestComparisonContent" class="comparison-content">
+                <!-- Will be filled by JS -->
+            </div>
+        </div>
+
         <div class="analogs-section">
             <h3>Анализ аналогов</h3>
             <div id="analogCard" class="analog-card">
@@ -120,6 +136,15 @@
 
         <div class="sources-section">
             <h3>Использованные источники</h3>
+            <button id="toggleAllOffers" class="toggle-offers-btn" style="display: none;">
+                📋 Показать все объявления
+            </button>
+            <div id="allOffersSection" class="all-offers-section hidden">
+                <h4 id="allOffersTitle">Все объявления</h4>
+                <div id="allOffersList" class="all-offers-list">
+                    <!-- Will be filled by JS -->
+                </div>
+            </div>
             <ul id="sourcesList" class="sources-list">
                 <li style="color: var(--muted); font-size: 12px;">
                     Источники появятся после анализа

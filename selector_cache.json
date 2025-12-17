@@ -1,0 +1,15 @@
+{
+  "alfaleasing.ru": {
+    "domain": "alfaleasing.ru",
+    "card_selector": ".a3buV.e1B_-, .e1B_-.d1B_-",
+    "title_selector": ".e1B_-, .d1B_- .k1B_-",
+    "price_selector": ".e1B_-.d1B_- .p1B_-",
+    "url_selector": ".e1B_-.d1B_- a",
+    "location_selector": null,
+    "year_selector": null,
+    "specs_selector": null,
+    "description_selector": null,
+    "created_at": 1765974320.684992,
+    "success_rate": 1.0
+  }
+}

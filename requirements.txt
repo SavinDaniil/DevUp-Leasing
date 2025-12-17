@@ -8,5 +8,7 @@ selenium
 urllib3
 
 python-dotenv
+tenacity
+tqdm
 
 python-multipart

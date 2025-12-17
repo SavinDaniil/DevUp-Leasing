@@ -75,7 +75,10 @@ form.addEventListener("submit", async (e) => {
     currentAnalogIndex = 0;
 
     render(data, clientPrice);
-    renderSources(data.sources || []);   // новая строка
+    renderSources(data.sources || []);
+    renderBestOriginal(data);
+    renderBestComparison(data);
+    renderAllOffers(data.sources || []);
 
     loading.classList.remove("show");
     resultContent.classList.add("show");
@@ -103,6 +106,15 @@ form.addEventListener("submit", async (e) => {
 // ===== РЕНДЕР МЕТРИК =====
 function render(data, clientPrice) {
   console.log("[DEBUG] Рендеринг данных:", data);
+
+  // Update title
+  const titleEl = document.getElementById("resultTitle");
+  if (titleEl) {
+    const itemName = data.vendor && data.model 
+      ? `${data.vendor} ${data.model}` 
+      : data.market_report?.item || "Результат анализа";
+    titleEl.textContent = `📊 Анализ: ${itemName}`;
+  }
 
   const marketReport = data.market_report || {};
   const minPrice = marketReport.market_range ? marketReport.market_range[0] : null;
@@ -240,4 +252,285 @@ function renderSources(sources) {
     }
     list.appendChild(li);
   });
+}
+
+// ===== RENDER BEST ORIGINAL OFFER =====
+function renderBestOriginal(data) {
+  const section = document.getElementById("bestOriginalSection");
+  const card = document.getElementById("bestOriginalCard");
+  
+  if (!section || !card) return;
+  
+  const bestOffer = data.best_original_offer;
+  const analysis = data.best_original_analysis;
+  
+  if (!bestOffer || !analysis) {
+    section.classList.add("hidden");
+    return;
+  }
+  
+  section.classList.remove("hidden");
+  
+  let html = `<div class="best-offer-title">${bestOffer.title || "Лучшее объявление"}</div>`;
+  
+  if (bestOffer.url) {
+    html += `<div class="best-offer-url"><a href="${bestOffer.url}" target="_blank">${bestOffer.url}</a></div>`;
+  }
+  
+  if (bestOffer.price_str) {
+    html += `<div style="font-size: 14px; margin: 8px 0;">💰 Цена: <strong>${bestOffer.price_str}</strong></div>`;
+  }
+  
+  if (bestOffer.year) {
+    html += `<div style="font-size: 13px; color: var(--muted);">📅 Год: ${bestOffer.year}</div>`;
+  }
+  
+  if (bestOffer.condition) {
+    html += `<div style="font-size: 13px; color: var(--muted);">⚙️ Состояние: ${bestOffer.condition}</div>`;
+  }
+  
+  const score = analysis.best_score || 0;
+  html += `<div class="best-offer-score">⭐ Оценка: ${score.toFixed(1)}/10</div>`;
+  
+  if (analysis.reason) {
+    html += `<div class="best-offer-reason">💡 ${analysis.reason}</div>`;
+  }
+  
+  card.innerHTML = html;
+}
+
+// ===== RENDER BEST OFFERS COMPARISON =====
+function renderBestComparison(data) {
+  const section = document.getElementById("bestComparisonSection");
+  const content = document.getElementById("bestComparisonContent");
+  
+  if (!section || !content) return;
+  
+  const comparisons = data.best_offers_comparison || {};
+  
+  if (Object.keys(comparisons).length === 0) {
+    section.classList.add("hidden");
+    return;
+  }
+  
+  section.classList.remove("hidden");
+  content.innerHTML = "";
+  
+  for (const [analogName, comp] of Object.entries(comparisons)) {
+    const div = document.createElement("div");
+    div.className = "comparison-item";
+    
+    let html = `<div class="comparison-header">`;
+    html += `<div><strong>Оригинал</strong> vs <strong>${analogName}</strong></div>`;
+    html += `<div class="comparison-winner">🏆 ${comp.winner === "original" ? "Оригинал" : "Аналог"}</div>`;
+    html += `</div>`;
+    
+    html += `<div class="comparison-scores">`;
+    html += `<div class="comparison-score">Оригинал: ${(comp.original_score || 0).toFixed(1)}/10</div>`;
+    html += `<div class="comparison-score">Аналог: ${(comp.analog_score || 0).toFixed(1)}/10</div>`;
+    html += `</div>`;
+    
+    // Links to offers
+    html += `<div class="comparison-links">`;
+    if (comp.original_url) {
+      html += `<div class="offer-link">`;
+      html += `<strong>🔗 Оригинал:</strong> `;
+      html += `<a href="${comp.original_url}" target="_blank" rel="noopener noreferrer">${comp.original_title || comp.original_url}</a>`;
+      html += `</div>`;
+    }
+    if (comp.analog_url) {
+      html += `<div class="offer-link">`;
+      html += `<strong>🔗 Аналог:</strong> `;
+      html += `<a href="${comp.analog_url}" target="_blank" rel="noopener noreferrer">${comp.analog_title || comp.analog_url}</a>`;
+      html += `</div>`;
+    }
+    html += `</div>`;
+    
+    // Detailed comparison
+    if (comp.comparison_details) {
+      html += `<div class="comparison-details">`;
+      html += `<h4>📊 Детальное сравнение:</h4>`;
+      if (comp.comparison_details.price) {
+        html += `<div class="detail-item"><strong>💰 Цена:</strong> ${comp.comparison_details.price}</div>`;
+      }
+      if (comp.comparison_details.quality) {
+        html += `<div class="detail-item"><strong>⚙️ Качество:</strong> ${comp.comparison_details.quality}</div>`;
+      }
+      if (comp.comparison_details.financing) {
+        html += `<div class="detail-item"><strong>💳 Финансирование:</strong> ${comp.comparison_details.financing}</div>`;
+      }
+      if (comp.comparison_details.reliability) {
+        html += `<div class="detail-item"><strong>🛡️ Надежность:</strong> ${comp.comparison_details.reliability}</div>`;
+      }
+      if (comp.comparison_details.value) {
+        html += `<div class="detail-item"><strong>⭐ Ценность:</strong> ${comp.comparison_details.value}</div>`;
+      }
+      html += `</div>`;
+    }
+    
+    // Key differences
+    if (comp.key_differences && comp.key_differences.length > 0) {
+      html += `<div class="key-differences">`;
+      html += `<h4>🔑 Ключевые отличия:</h4>`;
+      html += `<ul>`;
+      comp.key_differences.forEach(diff => {
+        html += `<li>${diff}</li>`;
+      });
+      html += `</ul></div>`;
+    }
+    
+    // Price comparison
+    if (comp.price_comparison) {
+      const pc = comp.price_comparison;
+      const origPrice = pc.original_price ? pc.original_price.toLocaleString("ru-RU") + " ₽" : "—";
+      const analogPrice = pc.analog_price ? pc.analog_price.toLocaleString("ru-RU") + " ₽" : "—";
+      const diff = pc.difference_percent ? `${pc.difference_percent > 0 ? "+" : ""}${pc.difference_percent.toFixed(1)}%` : "";
+      
+      html += `<div class="comparison-price">`;
+      html += `<strong>💰 Сравнение цен:</strong><br>`;
+      html += `Оригинал: ${origPrice}`;
+      if (pc.monthly_payment_original) {
+        html += ` (${pc.monthly_payment_original.toLocaleString("ru-RU")} ₽/мес)`;
+      }
+      html += `<br>Аналог: ${analogPrice}`;
+      if (pc.monthly_payment_analog) {
+        html += ` (${pc.monthly_payment_analog.toLocaleString("ru-RU")} ₽/мес)`;
+      }
+      if (diff) {
+        html += `<br>Разница: <strong>${diff}</strong>`;
+      }
+      html += `</div>`;
+    }
+    
+    // Pros and cons
+    html += `<div class="comparison-pros-cons">`;
+    
+    if (comp.pros_original && comp.pros_original.length > 0) {
+      html += `<div class="comparison-pros">`;
+      html += `<h4 style="color: var(--accent);">✅ Плюсы оригинала</h4>`;
+      html += `<ul>`;
+      comp.pros_original.slice(0, 3).forEach(p => {
+        html += `<li>+ ${p}</li>`;
+      });
+      html += `</ul></div>`;
+    }
+    
+    if (comp.cons_original && comp.cons_original.length > 0) {
+      html += `<div class="comparison-cons">`;
+      html += `<h4 style="color: var(--danger);">❌ Минусы оригинала</h4>`;
+      html += `<ul>`;
+      comp.cons_original.slice(0, 3).forEach(c => {
+        html += `<li>- ${c}</li>`;
+      });
+      html += `</ul></div>`;
+    }
+    
+    if (comp.pros_analog && comp.pros_analog.length > 0) {
+      html += `<div class="comparison-pros">`;
+      html += `<h4 style="color: var(--accent);">✅ Плюсы аналога</h4>`;
+      html += `<ul>`;
+      comp.pros_analog.slice(0, 3).forEach(p => {
+        html += `<li>+ ${p}</li>`;
+      });
+      html += `</ul></div>`;
+    }
+    
+    if (comp.cons_analog && comp.cons_analog.length > 0) {
+      html += `<div class="comparison-cons">`;
+      html += `<h4 style="color: var(--danger);">❌ Минусы аналога</h4>`;
+      html += `<ul>`;
+      comp.cons_analog.slice(0, 3).forEach(c => {
+        html += `<li>- ${c}</li>`;
+      });
+      html += `</ul></div>`;
+    }
+    
+    html += `</div>`;
+    
+    // Recommendation
+    if (comp.recommendation) {
+      html += `<div class="comparison-recommendation">`;
+      html += `<strong>💡 Рекомендация:</strong><br>${comp.recommendation}`;
+      html += `</div>`;
+    }
+    
+    div.innerHTML = html;
+    content.appendChild(div);
+  }
+}
+
+// ===== RENDER ALL OFFERS =====
+function renderAllOffers(sources) {
+  const toggleBtn = document.getElementById("toggleAllOffers");
+  const section = document.getElementById("allOffersSection");
+  const list = document.getElementById("allOffersList");
+  
+  if (!toggleBtn || !section || !list) return;
+  
+  if (!sources || sources.length === 0) {
+    toggleBtn.style.display = "none";
+    return;
+  }
+  
+  toggleBtn.style.display = "block";
+  list.innerHTML = "";
+  
+  sources.forEach((offer, index) => {
+    const div = document.createElement("div");
+    div.className = "offer-item";
+    
+    let html = `<div class="offer-item-header">`;
+    html += `<span class="offer-number">#${index + 1}</span>`;
+    if (offer.url) {
+      html += `<a href="${offer.url}" target="_blank" rel="noopener noreferrer" class="offer-title-link">${offer.title || "Объявление"}</a>`;
+    } else {
+      html += `<span class="offer-title">${offer.title || "Объявление"}</span>`;
+    }
+    html += `</div>`;
+    
+    html += `<div class="offer-item-details">`;
+    if (offer.source) {
+      html += `<span class="offer-source">📍 ${offer.source}</span>`;
+    }
+    if (offer.price_str) {
+      html += `<span class="offer-price">💰 ${offer.price_str}</span>`;
+    }
+    if (offer.monthly_payment_str) {
+      html += `<span class="offer-payment">💳 ${offer.monthly_payment_str}/мес</span>`;
+    }
+    if (offer.year) {
+      html += `<span class="offer-year">📅 ${offer.year}</span>`;
+    }
+    if (offer.condition) {
+      html += `<span class="offer-condition">⚙️ ${offer.condition}</span>`;
+    }
+    if (offer.location) {
+      html += `<span class="offer-location">🌍 ${offer.location}</span>`;
+    }
+    html += `</div>`;
+    
+    div.innerHTML = html;
+    list.appendChild(div);
+  });
+  
+  // Update title
+  const titleEl = document.getElementById("allOffersTitle");
+  if (titleEl) {
+    titleEl.textContent = `Все объявления (${sources.length})`;
+  }
+  
+  // Toggle button handler
+  toggleBtn.onclick = () => {
+    const isHidden = section.classList.contains("hidden");
+    if (isHidden) {
+      section.classList.remove("hidden");
+      toggleBtn.textContent = "📋 Скрыть все объявления";
+    } else {
+      section.classList.add("hidden");
+      toggleBtn.textContent = `📋 Показать все объявления (${sources.length})`;
+    }
+  };
+  
+  // Update button text
+  toggleBtn.textContent = `📋 Показать все объявления (${sources.length})`;
 }
