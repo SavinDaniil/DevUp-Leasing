@@ -2,16 +2,28 @@
 <html lang="ru">
 <head>
     <meta charset="UTF-8" />
-    <title>Анализатор имущества</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Анализатор имущества | Sonar AI</title>
     <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
-    <link rel="stylesheet" href="/static/style.css?v=2" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css?v=5" />
 </head>
 <body>
 <div class="container">
     <!-- Левая панель: ввод -->
     <div class="left-panel">
-        <h1>Анализ имущества</h1>
-        <p class="subtitle">Оценка рыночной стоимости и поиск аналогов</p>
+        <h1>🎯 Анализ имущества</h1>
+        <p class="subtitle">Рыночная оценка и интеллектуальный поиск аналогов с помощью AI</p>
+        
+        <div class="sonar-info-badge">
+            <span class="icon">🤖</span>
+            <span class="text">
+                <strong>Perplexity Sonar AI</strong>
+                Автоматический поиск аналогов и сравнение
+            </span>
+        </div>
 
         <form id="analyzeForm">
             <div class="form-group">
@@ -19,7 +31,7 @@
                 <input
                     type="text"
                     id="item"
-                    placeholder="Например: BMW M5 2024"
+                    placeholder="Например: BMW X5 2024, iPhone 16 Pro Max"
                     required
                 />
             </div>
@@ -36,125 +48,116 @@
             <div class="form-group">
                 <label>Использовать ИИ для анализа</label>
                 <div class="ai-toggle">
-                    <button
-                        type="button"
-                        class="ai-btn active"
-                        data-value="true"
-                    >
-                        ✅ Использовать
+                    <button type="button" class="ai-btn active" data-value="true">
+                        ✅ С ИИ
                     </button>
-                    <button
-                        type="button"
-                        class="ai-btn"
-                        data-value="false"
-                    >
-                        ❌ Не использовать
+                    <button type="button" class="ai-btn" data-value="false">
+                        📊 Только данные
                     </button>
                 </div>
                 <input type="hidden" id="useAI" value="true" />
             </div>
 
             <div class="form-group">
-                <label for="numResults">Сколько аналогов искать</label>
+                <label for="numResults">Количество результатов</label>
                 <input
                     type="number"
                     id="numResults"
                     min="1"
-                    max="20"
+                    max="10"
                     value="5"
                 />
             </div>
 
-            <button type="submit" class="submit-btn">Начать анализ</button>
+            <button type="submit" class="submit-btn">🚀 Начать анализ</button>
             <div id="error" class="error"></div>
         </form>
 
         <div id="placeholder" class="placeholder">
-            📋 Заполните форму и нажмите «Проанализировать»
+            📋 Введите название товара и нажмите «Начать анализ»
         </div>
-        <div id="loading" class="loading hidden">
-            <span class="gear">⚙️</span>
-            <span>Анализируем информацию...</span>
+        
+        <div id="loading" class="loading">
+            <div class="loading-spinner"></div>
+            <div class="loading-text">Анализируем рынок...</div>
+            <div class="loading-steps">
+                <div class="loading-step" id="step1">🔍 Поиск объявлений</div>
+                <div class="loading-step" id="step2">🤖 Sonar ищет аналоги</div>
+                <div class="loading-step" id="step3">📊 Анализ цен</div>
+                <div class="loading-step" id="step4">⚖️ Сравнение предложений</div>
+            </div>
         </div>
     </div>
 
     <!-- Правая панель: результат -->
     <div class="right-panel">
         <div id="resultContent" class="result-content">
-            <h2 id="resultTitle">Здесь будет результат анализа</h2>
+            <h2 id="resultTitle">📊 Результат анализа</h2>
 
             <div class="metrics-grid">
                 <div class="metric">
-                    <div class="metric-label">Диапазон рынка</div>
+                    <div class="metric-label">📈 Диапазон рынка</div>
                     <div class="metric-value" id="rangeValue">—</div>
                 </div>
                 <div class="metric">
-                    <div class="metric-label">Медиана</div>
+                    <div class="metric-label">📊 Медиана</div>
                     <div class="metric-value" id="medianValue">—</div>
                 </div>
                 <div class="metric">
-                    <div class="metric-label">Цена клиента</div>
+                    <div class="metric-label">💰 Цена клиента</div>
                     <div class="metric-value" id="clientValue">—</div>
                 </div>
                 <div class="metric">
-                    <div class="metric-label">Отклонение</div>
+                    <div class="metric-label">📐 Отклонение</div>
                     <div class="metric-value" id="deviationValue">—</div>
                 </div>
             </div>
 
-        <div id="commentSection" class="comment-section">
-            📂 Заполните форму слева, чтобы увидеть анализ.
-        </div>
-
-        <!-- Best Original Offer Section -->
-        <div id="bestOriginalSection" class="best-offer-section hidden">
-            <h3>🏆 Лучшее объявление оригинала</h3>
-            <div id="bestOriginalCard" class="best-offer-card">
-                <!-- Will be filled by JS -->
+            <div id="commentSection" class="comment-section">
+                📂 Заполните форму слева, чтобы увидеть анализ.
             </div>
-        </div>
 
-        <!-- Best Offers Comparison Section -->
-        <div id="bestComparisonSection" class="comparison-section hidden">
-            <h3>⚖️ Сравнение лучших объявлений</h3>
-            <div id="bestComparisonContent" class="comparison-content">
-                <!-- Will be filled by JS -->
+            <!-- Best Original Offer Section -->
+            <div id="bestOriginalSection" class="best-offer-section hidden">
+                <h3>🏆 Лучшее объявление</h3>
+                <div id="bestOriginalCard" class="best-offer-card"></div>
             </div>
-        </div>
 
-        <div class="analogs-section">
-            <h3>Анализ аналогов</h3>
-            <div id="analogCard" class="analog-card">
-                <p style="color: var(--muted);">Аналоги появятся после анализа</p>
+            <!-- Best Offers Comparison Section -->
+            <div id="bestComparisonSection" class="comparison-section hidden">
+                <h3>⚖️ Сравнение с аналогами</h3>
+                <div id="bestComparisonContent" class="comparison-content"></div>
             </div>
-            <div class="slider-controls">
-                <button class="slider-btn prev">← Предыдущий</button>
-                <span id="analogCounter">0/0</span>
-                <button class="slider-btn next">Следующий →</button>
-            </div>
-        </div>
 
-        <div class="sources-section">
-            <h3>Использованные источники</h3>
-            <button id="toggleAllOffers" class="toggle-offers-btn" style="display: none;">
-                📋 Показать все объявления
-            </button>
-            <div id="allOffersSection" class="all-offers-section hidden">
-                <h4 id="allOffersTitle">Все объявления</h4>
-                <div id="allOffersList" class="all-offers-list">
-                    <!-- Will be filled by JS -->
+            <div class="analogs-section">
+                <h3>🔄 Аналоги</h3>
+                <div id="analogCard" class="analog-card">
+                    <p style="color: var(--muted);">Аналоги появятся после анализа</p>
+                </div>
+                <div class="slider-controls">
+                    <button class="slider-btn prev">← Назад</button>
+                    <span id="analogCounter">0/0</span>
+                    <button class="slider-btn next">Далее →</button>
                 </div>
             </div>
-            <ul id="sourcesList" class="sources-list">
-                <li style="color: var(--muted); font-size: 12px;">
-                    Источники появятся после анализа
-                </li>
-            </ul>
+
+            <div class="sources-section">
+                <h3>📚 Источники</h3>
+                <button id="toggleAllOffers" class="toggle-offers-btn" style="display: none;">
+                    📋 Показать все объявления
+                </button>
+                <div id="allOffersSection" class="all-offers-section hidden">
+                    <h4 id="allOffersTitle">Все найденные объявления</h4>
+                    <div id="allOffersList" class="all-offers-list"></div>
+                </div>
+                <ul id="sourcesList" class="sources-list">
+                    <li style="color: var(--muted);">Источники появятся после анализа</li>
+                </ul>
+            </div>
         </div>
-    </div> <!-- resultContent -->
-</div>     <!-- right-panel -->
+    </div>
+</div>
 
-
-<script src="/static/script.js?v=2"></script>
+<script src="/static/script.js?v=5"></script>
 </body>
 </html>
