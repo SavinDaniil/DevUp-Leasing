@@ -610,6 +610,33 @@ class ListingSummary(TypedDict):
     price_guess: Optional[int]
 
 
+class SonarAnalogResult(TypedDict, total=False):
+    """Result from Sonar analog search."""
+    name: str
+    description: str
+    price_range: str
+    key_difference: str
+
+
+class SonarComparisonResult(TypedDict, total=False):
+    """Result from Sonar offer comparison."""
+    winner: str
+    original_advantages: list[str]
+    original_disadvantages: list[str]
+    analog_advantages: list[str]
+    analog_disadvantages: list[str]
+    recommendation: str
+    price_diff: str
+    price_verdict: str
+    original_url: str
+    original_title: str
+    original_price: Optional[int]
+    analog_url: str
+    analog_title: str
+    analog_price: Optional[int]
+    sonar_comparison: bool
+
+
 class UserInput(TypedDict):
     """User input parameters."""
     item: str
@@ -1333,8 +1360,6 @@ class AIAnalyzer:
 
 
 # =============================
-<<<<<<< Updated upstream
-=======
 # Sonar Analog Finder (Perplexity API)
 # =============================
 class SonarAnalogFinder:
@@ -1989,7 +2014,6 @@ def clear_sonar_cache() -> None:
 
 
 # =============================
->>>>>>> Stashed changes
 # Generic Parser Strategy (after AIAnalyzer)
 # =============================
 class GenericParserStrategy(ParserStrategy):
@@ -2713,35 +2737,6 @@ def collect_analogs(
     item_name: str,
     offers: list[LeasingOffer],
     use_ai: bool,
-<<<<<<< Updated upstream
-    analyzer: Optional[AIAnalyzer]
-) -> list[str]:
-    """Collect analog models from offers and AI suggestions."""
-    analogs_set = set()
-    
-    for o in offers:
-        for a in o.analogs:
-            analogs_set.add(a.strip())
-    
-    # If not enough analogs, try AI suggestion
-    if len(analogs_set) < CONFIG.min_analogs_before_ai and use_ai and analyzer:
-        ai_analogs = analyzer.suggest_analogs(item_name)
-        for a in ai_analogs:
-            analogs_set.add(a)
-    
-    # Fallback: search for "аналог" results
-    if len(analogs_set) < CONFIG.min_analogs_before_ai:
-        fallback_results = search_google(f"{item_name} аналог", 5)
-        for r in fallback_results:
-            title = r.get("title") or ""
-            parts = re.split(r"[–—|-]", title)
-            if parts:
-                candidate = parts[0].strip()
-                if candidate and len(candidate.split()) <= 6:
-                    analogs_set.add(candidate)
-
-    return [a for a in analogs_set if a]
-=======
     analyzer: Optional[AIAnalyzer],
     sonar_finder: Optional[SonarAnalogFinder] = None
 ) -> tuple[list[str], list[SonarAnalogResult]]:
@@ -2797,10 +2792,6 @@ def collect_analogs(
         logger.error(f"[SONAR] Error during Sonar search: {e}")
         logger.error("[SONAR] Cannot proceed without Sonar - no fallback methods available")
         return [], []
-<<<<<<< Updated upstream
->>>>>>> Stashed changes
-=======
->>>>>>> Stashed changes
 
 
 def fetch_listing_summaries(query: str, top_n: int = 3) -> list[ListingSummary]:
@@ -3520,9 +3511,7 @@ def run_pipeline(params: UserInput) -> tuple[list[LeasingOffer], dict, list[dict
     # Initialize components
     fetcher = SeleniumFetcher()
     cleaner = ContentCleaner()
-    
-<<<<<<< Updated upstream
-=======
+
     # Initialize Sonar for analog search (PRIMARY method)
     sonar_finder = get_sonar_finder()
     if sonar_finder:
@@ -3534,8 +3523,7 @@ def run_pipeline(params: UserInput) -> tuple[list[LeasingOffer], dict, list[dict
         logger.warning("[SONAR] Perplexity API not available - PERPLEXITY_API_KEY not set or invalid format (should start with 'pplx-' or 'sk-')")
         logger.error("[SONAR] Cannot proceed without Sonar - no fallback methods available")
         logger.warning("=" * 70)
-    
->>>>>>> Stashed changes
+
     analyzer = None
     if use_ai and CONFIG.gigachat_auth_data:
         client = GigaChatClient(CONFIG.gigachat_auth_data)
@@ -3592,18 +3580,10 @@ def run_pipeline(params: UserInput) -> tuple[list[LeasingOffer], dict, list[dict
                 if enriched_count > 0:
                     logger.info(f"Enriched {enriched_count} offers with technical specifications")
 
-<<<<<<< Updated upstream
-<<<<<<< Updated upstream
-        # Collect analogs
-        analogs = collect_analogs(item, offers, use_ai=use_ai, analyzer=analyzer)
-=======
-=======
->>>>>>> Stashed changes
         # Collect analogs (ONLY Sonar - no fallback methods)
         analogs, sonar_analog_details = collect_analogs(
             item, offers, use_ai=use_ai, analyzer=analyzer, sonar_finder=sonar_finder
         )
->>>>>>> Stashed changes
         
         # Generate initial report
         report = analyze_market(item, offers, client_price, sonar_finder=sonar_finder)
@@ -3679,28 +3659,12 @@ def run_pipeline(params: UserInput) -> tuple[list[LeasingOffer], dict, list[dict
                 listings = fetch_listing_summaries(f"{analog} купить", top_n=3)
                 price_list = [l["price_guess"] for l in listings if l.get("price_guess")]
                 avg_price_math = int(sum(price_list) / len(price_list)) if price_list else None
-                
-<<<<<<< Updated upstream
-<<<<<<< Updated upstream
-=======
+
                 # Use Sonar info if available (ONLY Sonar - no fallback)
->>>>>>> Stashed changes
-=======
-                # Use Sonar info if available (ONLY Sonar - no fallback)
->>>>>>> Stashed changes
                 pros, cons, note = [], [], ""
                 price_hint = None
                 best_link = None
 
-<<<<<<< Updated upstream
-                if use_ai and analyzer:
-                    ai_review = analyzer.review_analog(analog, listings)
-                    pros = ensure_list_str(ai_review.get("pros"))
-                    cons = ensure_list_str(ai_review.get("cons"))
-                    price_hint = ai_review.get("price_hint")
-                    note = ai_review.get("note", "")
-                    best_link = ai_review.get("best_link")
-=======
                 if sonar_info:
                     # Use Sonar description as note
                     note = sonar_info.get("description", "") or sonar_info.get("key_difference", "")
@@ -3714,11 +3678,7 @@ def run_pipeline(params: UserInput) -> tuple[list[LeasingOffer], dict, list[dict
                 else:
                     # Если Sonar info нет - оставляем пустые значения (нет fallback)
                     logger.warning(f"[SONAR] No Sonar info for {analog} - pros/cons will be empty")
-<<<<<<< Updated upstream
->>>>>>> Stashed changes
-=======
->>>>>>> Stashed changes
-                
+
                 final_price = price_hint if price_hint else avg_price_math
                 if best_analog_offer and best_analog_offer.price:
                     final_price = best_analog_offer.price
@@ -3746,15 +3706,7 @@ def run_pipeline(params: UserInput) -> tuple[list[LeasingOffer], dict, list[dict
             logger.info("DEEP ANALYSIS: Comparing best original with best analogs...")
             logger.info("=" * 70)
             
-<<<<<<< Updated upstream
-            comparisons = compare_best_offers_original_vs_analogs(
-                best_original=best_original_offer,
-                best_analogs=best_analog_offers,
-                original_name=item,
-                analyzer=analyzer,
-                use_ai=use_ai
-            )
-=======
+            comparisons = {}
             comparisons = {}
             
             # Prepare original offer data
@@ -3828,10 +3780,6 @@ def run_pipeline(params: UserInput) -> tuple[list[LeasingOffer], dict, list[dict
             if not sonar_finder or not sonar_finder.is_available():
                 logger.error("[SONAR] Sonar not available - cannot perform comparisons without Sonar")
                 logger.error("[SONAR] No comparisons will be performed")
-<<<<<<< Updated upstream
->>>>>>> Stashed changes
-=======
->>>>>>> Stashed changes
             
             report["best_offers_comparison"] = comparisons
         
