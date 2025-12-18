@@ -98,7 +98,17 @@ class Config:
     
     # API Keys (loaded from environment)
     serper_api_key: Optional[str] = field(default_factory=lambda: os.getenv("SERPER_API_KEY"))
+    perplexity_api_key: Optional[str] = field(
+    default_factory=lambda: os.getenv("PERPLEXITY_API_KEY")
+    
+)
+        # Sonar (Perplexity) API settings
+    sonar_base_url: Optional[str] = field(default_factory=lambda: os.getenv("PERPLEXITY_BASE_URL"))
+    sonar_api_url: str = "https://api.perplexity.ai/chat/completions"
+    sonar_model: str = field(default_factory=lambda: os.getenv("PERPLEXITY_MODEL", "sonar-reasoning-pro"))
+
     gigachat_auth_data: Optional[str] = field(default_factory=lambda: os.getenv("GIGACHAT_AUTH_DATA"))
+    
     
     # HTTP settings
     http_timeout: int = 20
@@ -212,6 +222,11 @@ class RateLimiter:
 # Global rate limiters
 google_rate_limiter = RateLimiter(CONFIG.google_rate_limit_calls, CONFIG.google_rate_limit_period)
 gigachat_rate_limiter = RateLimiter(
+    CONFIG.gigachat_rate_limit_calls, 
+    CONFIG.gigachat_rate_limit_period,
+    min_delay=CONFIG.gigachat_min_delay
+)
+sonar_rate_limiter = RateLimiter(
     CONFIG.gigachat_rate_limit_calls, 
     CONFIG.gigachat_rate_limit_period,
     min_delay=CONFIG.gigachat_min_delay
@@ -3664,6 +3679,10 @@ def run_pipeline(params: UserInput) -> tuple[list[LeasingOffer], dict, list[dict
                 pros, cons, note = [], [], ""
                 price_hint = None
                 best_link = None
+                sonar_info = None
+                sonar_rate_limiter = RateLimiter(CONFIG.gigachat_rate_limit_calls, CONFIG.gigachat_rate_limit_period, min_delay=CONFIG.gigachat_min_delay)
+
+
 
                 if sonar_info:
                     # Use Sonar description as note
