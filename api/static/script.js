@@ -8,6 +8,7 @@ const nextBtn = document.querySelector(".slider-btn.next");
 
 let currentAnalogIndex = 0;
 let analogsData = [];
+let loadingInterval = null; // Для управления анимацией загрузки
 
 // ===== ПЕРЕКЛЮЧАТЕЛЬ ИИ =====
 document.querySelectorAll(".ai-btn").forEach((btn) => {
@@ -20,8 +21,6 @@ document.querySelectorAll(".ai-btn").forEach((btn) => {
   });
 });
 
-<<<<<<< Updated upstream
-=======
 // ===== АНИМАЦИЯ ЗАГРУЗКИ =====
 function startLoadingAnimation() {
   const steps = ["step1", "step2", "step3", "step4"];
@@ -111,10 +110,6 @@ function validateForm() {
   return true;
 }
 
-<<<<<<< Updated upstream
->>>>>>> Stashed changes
-=======
->>>>>>> Stashed changes
 // ===== ОТПРАВКА ФОРМЫ =====
 form.addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -145,21 +140,6 @@ form.addEventListener("submit", async (e) => {
   console.log("[DEBUG] numResults:", numResults);
 
   try {
-<<<<<<< Updated upstream
-<<<<<<< Updated upstream
-    console.log("[DEBUG] Отправляем запрос на /api/describe");
-
-=======
-=======
->>>>>>> Stashed changes
-    // Таймаут для запроса (5 минут)
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 300000);
-    
-<<<<<<< Updated upstream
->>>>>>> Stashed changes
-=======
->>>>>>> Stashed changes
     const resp = await fetch("/api/describe", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -173,44 +153,8 @@ form.addEventListener("submit", async (e) => {
     });
     
     clearTimeout(timeoutId);
-<<<<<<< Updated upstream
-
-    console.log("[DEBUG] Ответ получен, статус:", resp.status);
 
     if (!resp.ok) {
-<<<<<<< Updated upstream
-      const errText = await resp.text();
-      console.error("[ERROR] Ответ ошибки:", errText);
-      throw new Error("Ошибка сервера: " + resp.status);
-=======
-=======
-
-    if (!resp.ok) {
->>>>>>> Stashed changes
-      let errorMessage = "Ошибка сервера";
-      try {
-        const errorData = await resp.json();
-        errorMessage = errorData.detail || errorData.message || errorMessage;
-      } catch {
-        const errorText = await resp.text();
-        if (errorText) {
-          errorMessage = errorText.substring(0, 200);
-        }
-      }
-      
-      if (resp.status === 429) {
-        errorMessage = "Слишком много запросов. Пожалуйста, подождите минуту перед повторной попыткой.";
-      } else if (resp.status === 400) {
-        errorMessage = "Ошибка валидации: " + errorMessage;
-      } else if (resp.status >= 500) {
-        errorMessage = "Внутренняя ошибка сервера. Пожалуйста, попробуйте позже.";
-      }
-      
-      throw new Error(errorMessage);
-<<<<<<< Updated upstream
->>>>>>> Stashed changes
-=======
->>>>>>> Stashed changes
     }
 
      const data = await resp.json();
@@ -241,36 +185,6 @@ form.addEventListener("submit", async (e) => {
       updateAnalogCounter();
     }
   } catch (err) {
-<<<<<<< Updated upstream
-<<<<<<< Updated upstream
-    console.error("[ERROR]", err.message);
-    loading.classList.remove("show");
-    placeholder.classList.remove("hidden");
-    error.classList.add("show");
-    error.textContent = "Ошибка: " + err.message;
-=======
-=======
->>>>>>> Stashed changes
-    console.error("[ERROR]", err);
-    stopLoadingAnimation();
-    loading.classList.remove("show");
-    placeholder.classList.remove("hidden");
-    error.classList.add("show");
-    
-    // Улучшенная обработка различных типов ошибок
-    if (err.name === "AbortError") {
-      error.textContent = "❌ Запрос превысил время ожидания (5 минут). Попробуйте еще раз.";
-    } else if (err.message) {
-      error.textContent = "❌ " + err.message;
-    } else if (err instanceof TypeError && err.message.includes("fetch")) {
-      error.textContent = "❌ Ошибка сети. Проверьте подключение к интернету.";
-    } else {
-      error.textContent = "❌ Произошла неизвестная ошибка. Пожалуйста, попробуйте позже.";
-    }
-<<<<<<< Updated upstream
->>>>>>> Stashed changes
-=======
->>>>>>> Stashed changes
   } finally {
     form.querySelector("button").disabled = false;
   }
