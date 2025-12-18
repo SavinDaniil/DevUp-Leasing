@@ -299,7 +299,7 @@ function renderBestOriginal(data) {
   card.innerHTML = html;
 }
 
-// ===== RENDER BEST OFFERS COMPARISON =====
+// ===== RENDER BEST OFFERS COMPARISON (КАРУСЕЛЬ) =====
 function renderBestComparison(data) {
   const section = document.getElementById("bestComparisonSection");
   const content = document.getElementById("bestComparisonContent");
@@ -316,148 +316,324 @@ function renderBestComparison(data) {
   section.classList.remove("hidden");
   content.innerHTML = "";
   
-  for (const [analogName, comp] of Object.entries(comparisons)) {
-    const div = document.createElement("div");
-    div.className = "comparison-item";
-    
-    let html = `<div class="comparison-header">`;
-    html += `<div><strong>Оригинал</strong> vs <strong>${analogName}</strong></div>`;
-    html += `<div class="comparison-winner">🏆 ${comp.winner === "original" ? "Оригинал" : "Аналог"}</div>`;
+  // Сохраняем данные для карусели
+  window.lastAnalysisData = data;
+  window.comparisonsArray = Object.entries(comparisons);
+  window.currentComparisonIndex = 0;
+  
+  // Показываем первый элемент
+  renderComparisonSlide();
+  
+  // Обновляем счётчик
+  updateComparisonCounter();
+}
+
+// Отображение одного слайда карусели
+function renderComparisonSlide() {
+  const content = document.getElementById("bestComparisonContent");
+  if (!content || !window.comparisonsArray || window.comparisonsArray.length === 0) return;
+  
+  const [analogName, comp] = window.comparisonsArray[window.currentComparisonIndex];
+  const data = window.lastAnalysisData;
+  
+  content.innerHTML = `<h3 style="margin: 0 0 12px 0; font-size: 16px; color: var(--text); font-weight: 600; padding-bottom: 12px; border-bottom: 1px solid var(--border);">🎪 Сравнение лучших объявлений</h3>`;
+  
+  const div = document.createElement("div");
+  div.className = "comparison-item";
+  
+  let html = `<div class="comparison-header">`;
+  html += `<div><strong>${data.vendor || "Оригинал"}</strong> vs <strong>${analogName}</strong></div>`;
+  html += `<div class="comparison-winner">🏆 ${comp.winner === "original" ? "Оригинал" : "Аналог"}</div>`;
+  html += `</div>`;
+  
+  html += `<div class="comparison-scores">`;
+  html += `<div class="comparison-score">Оригинал: ${(comp.original_score || 0).toFixed(1)}/10</div>`;
+  html += `<div class="comparison-score">Аналог: ${(comp.analog_score || 0).toFixed(1)}/10</div>`;
+  html += `</div>`;
+  
+  // Links to offers
+  html += `<div class="comparison-links">`;
+  if (comp.original_url) {
+    html += `<div class="offer-link">`;
+    html += `<strong>🔗 Оригинал:</strong> `;
+    html += `<a href="${comp.original_url}" target="_blank" rel="noopener noreferrer">${comp.original_title || comp.original_url}</a>`;
     html += `</div>`;
-    
-    html += `<div class="comparison-scores">`;
-    html += `<div class="comparison-score">Оригинал: ${(comp.original_score || 0).toFixed(1)}/10</div>`;
-    html += `<div class="comparison-score">Аналог: ${(comp.analog_score || 0).toFixed(1)}/10</div>`;
+  }
+  if (comp.analog_url) {
+    html += `<div class="offer-link">`;
+    html += `<strong>🔗 Аналог:</strong> `;
+    html += `<a href="${comp.analog_url}" target="_blank" rel="noopener noreferrer">${comp.analog_title || comp.analog_url}</a>`;
     html += `</div>`;
-    
-    // Links to offers
-    html += `<div class="comparison-links">`;
-    if (comp.original_url) {
-      html += `<div class="offer-link">`;
-      html += `<strong>🔗 Оригинал:</strong> `;
-      html += `<a href="${comp.original_url}" target="_blank" rel="noopener noreferrer">${comp.original_title || comp.original_url}</a>`;
-      html += `</div>`;
+  }
+  html += `</div>`;
+  
+  // Detailed comparison
+  if (comp.comparison_details) {
+    html += `<div class="comparison-details">`;
+    html += `<h4>📊 Детальное сравнение:</h4>`;
+    if (comp.comparison_details.price) {
+      html += `<div class="detail-item"><strong>💰 Цена:</strong> ${comp.comparison_details.price}</div>`;
     }
-    if (comp.analog_url) {
-      html += `<div class="offer-link">`;
-      html += `<strong>🔗 Аналог:</strong> `;
-      html += `<a href="${comp.analog_url}" target="_blank" rel="noopener noreferrer">${comp.analog_title || comp.analog_url}</a>`;
-      html += `</div>`;
+    if (comp.comparison_details.quality) {
+      html += `<div class="detail-item"><strong>⚙️ Качество:</strong> ${comp.comparison_details.quality}</div>`;
+    }
+    if (comp.comparison_details.financing) {
+      html += `<div class="detail-item"><strong>💳 Финансирование:</strong> ${comp.comparison_details.financing}</div>`;
+    }
+    if (comp.comparison_details.reliability) {
+      html += `<div class="detail-item"><strong>🛡️ Надежность:</strong> ${comp.comparison_details.reliability}</div>`;
+    }
+    if (comp.comparison_details.value) {
+      html += `<div class="detail-item"><strong>⭐ Ценность:</strong> ${comp.comparison_details.value}</div>`;
     }
     html += `</div>`;
+  }
+  
+  // Key differences
+  if (comp.key_differences && comp.key_differences.length > 0) {
+    html += `<div class="key-differences">`;
+    html += `<h4>🔑 Ключевые отличия:</h4>`;
+    html += `<ul>`;
+    comp.key_differences.forEach(diff => {
+      html += `<li>${diff}</li>`;
+    });
+    html += `</ul></div>`;
+  }
+  
+  // Price comparison
+  if (comp.price_comparison) {
+    const pc = comp.price_comparison;
+    const origPrice = pc.original_price ? pc.original_price.toLocaleString("ru-RU") + " ₽" : "—";
+    const analogPrice = pc.analog_price ? pc.analog_price.toLocaleString("ru-RU") + " ₽" : "—";
+    const diff = pc.difference_percent ? `${pc.difference_percent > 0 ? "+" : ""}${pc.difference_percent.toFixed(1)}%` : "";
     
-    // Detailed comparison
-    if (comp.comparison_details) {
-      html += `<div class="comparison-details">`;
-      html += `<h4>📊 Детальное сравнение:</h4>`;
-      if (comp.comparison_details.price) {
-        html += `<div class="detail-item"><strong>💰 Цена:</strong> ${comp.comparison_details.price}</div>`;
-      }
-      if (comp.comparison_details.quality) {
-        html += `<div class="detail-item"><strong>⚙️ Качество:</strong> ${comp.comparison_details.quality}</div>`;
-      }
-      if (comp.comparison_details.financing) {
-        html += `<div class="detail-item"><strong>💳 Финансирование:</strong> ${comp.comparison_details.financing}</div>`;
-      }
-      if (comp.comparison_details.reliability) {
-        html += `<div class="detail-item"><strong>🛡️ Надежность:</strong> ${comp.comparison_details.reliability}</div>`;
-      }
-      if (comp.comparison_details.value) {
-        html += `<div class="detail-item"><strong>⭐ Ценность:</strong> ${comp.comparison_details.value}</div>`;
-      }
-      html += `</div>`;
+    html += `<div class="comparison-price">`;
+    html += `<strong>💰 Сравнение цен:</strong><br>`;
+    html += `Оригинал: ${origPrice}`;
+    if (pc.monthly_payment_original) {
+      html += ` (${pc.monthly_payment_original.toLocaleString("ru-RU")} ₽/мес)`;
     }
-    
-    // Key differences
-    if (comp.key_differences && comp.key_differences.length > 0) {
-      html += `<div class="key-differences">`;
-      html += `<h4>🔑 Ключевые отличия:</h4>`;
-      html += `<ul>`;
-      comp.key_differences.forEach(diff => {
-        html += `<li>${diff}</li>`;
-      });
-      html += `</ul></div>`;
+    html += `<br>Аналог: ${analogPrice}`;
+    if (pc.monthly_payment_analog) {
+      html += ` (${pc.monthly_payment_analog.toLocaleString("ru-RU")} ₽/мес)`;
     }
-    
-    // Price comparison
-    if (comp.price_comparison) {
-      const pc = comp.price_comparison;
-      const origPrice = pc.original_price ? pc.original_price.toLocaleString("ru-RU") + " ₽" : "—";
-      const analogPrice = pc.analog_price ? pc.analog_price.toLocaleString("ru-RU") + " ₽" : "—";
-      const diff = pc.difference_percent ? `${pc.difference_percent > 0 ? "+" : ""}${pc.difference_percent.toFixed(1)}%` : "";
-      
-      html += `<div class="comparison-price">`;
-      html += `<strong>💰 Сравнение цен:</strong><br>`;
-      html += `Оригинал: ${origPrice}`;
-      if (pc.monthly_payment_original) {
-        html += ` (${pc.monthly_payment_original.toLocaleString("ru-RU")} ₽/мес)`;
-      }
-      html += `<br>Аналог: ${analogPrice}`;
-      if (pc.monthly_payment_analog) {
-        html += ` (${pc.monthly_payment_analog.toLocaleString("ru-RU")} ₽/мес)`;
-      }
-      if (diff) {
-        html += `<br>Разница: <strong>${diff}</strong>`;
-      }
-      html += `</div>`;
+    if (diff) {
+      html += `<br>Разница: <strong>${diff}</strong>`;
     }
-    
-    // Pros and cons
-    html += `<div class="comparison-pros-cons">`;
-    
-    if (comp.pros_original && comp.pros_original.length > 0) {
-      html += `<div class="comparison-pros">`;
-      html += `<h4 style="color: var(--accent);">✅ Плюсы оригинала</h4>`;
-      html += `<ul>`;
-      comp.pros_original.slice(0, 3).forEach(p => {
-        html += `<li>+ ${p}</li>`;
-      });
-      html += `</ul></div>`;
-    }
-    
-    if (comp.cons_original && comp.cons_original.length > 0) {
-      html += `<div class="comparison-cons">`;
-      html += `<h4 style="color: var(--danger);">❌ Минусы оригинала</h4>`;
-      html += `<ul>`;
-      comp.cons_original.slice(0, 3).forEach(c => {
-        html += `<li>- ${c}</li>`;
-      });
-      html += `</ul></div>`;
-    }
-    
-    if (comp.pros_analog && comp.pros_analog.length > 0) {
-      html += `<div class="comparison-pros">`;
-      html += `<h4 style="color: var(--accent);">✅ Плюсы аналога</h4>`;
-      html += `<ul>`;
-      comp.pros_analog.slice(0, 3).forEach(p => {
-        html += `<li>+ ${p}</li>`;
-      });
-      html += `</ul></div>`;
-    }
-    
-    if (comp.cons_analog && comp.cons_analog.length > 0) {
-      html += `<div class="comparison-cons">`;
-      html += `<h4 style="color: var(--danger);">❌ Минусы аналога</h4>`;
-      html += `<ul>`;
-      comp.cons_analog.slice(0, 3).forEach(c => {
-        html += `<li>- ${c}</li>`;
-      });
-      html += `</ul></div>`;
-    }
-    
     html += `</div>`;
-    
-    // Recommendation
-    if (comp.recommendation) {
-      html += `<div class="comparison-recommendation">`;
-      html += `<strong>💡 Рекомендация:</strong><br>${comp.recommendation}`;
-      html += `</div>`;
-    }
-    
-    div.innerHTML = html;
-    content.appendChild(div);
+  }
+  
+  // Pros and cons
+  html += `<div class="comparison-pros-cons">`;
+  
+  if (comp.pros_original && comp.pros_original.length > 0) {
+    html += `<div class="comparison-pros">`;
+    html += `<h4 style="color: var(--accent);">✅ Плюсы оригинала</h4>`;
+    html += `<ul>`;
+    comp.pros_original.slice(0, 3).forEach(p => {
+      html += `<li>+ ${p}</li>`;
+    });
+    html += `</ul></div>`;
+  }
+  
+  if (comp.cons_original && comp.cons_original.length > 0) {
+    html += `<div class="comparison-cons">`;
+    html += `<h4 style="color: var(--danger);">❌ Минусы оригинала</h4>`;
+    html += `<ul>`;
+    comp.cons_original.slice(0, 3).forEach(c => {
+      html += `<li>- ${c}</li>`;
+    });
+    html += `</ul></div>`;
+  }
+  
+  if (comp.pros_analog && comp.pros_analog.length > 0) {
+    html += `<div class="comparison-pros">`;
+    html += `<h4 style="color: var(--accent);">✅ Плюсы аналога</h4>`;
+    html += `<ul>`;
+    comp.pros_analog.slice(0, 3).forEach(p => {
+      html += `<li>+ ${p}</li>`;
+    });
+    html += `</ul></div>`;
+  }
+  
+  if (comp.cons_analog && comp.cons_analog.length > 0) {
+    html += `<div class="comparison-cons">`;
+    html += `<h4 style="color: var(--danger);">❌ Минусы аналога</h4>`;
+    html += `<ul>`;
+    comp.cons_analog.slice(0, 3).forEach(c => {
+      html += `<li>- ${c}</li>`;
+    });
+    html += `</ul></div>`;
+  }
+  
+  html += `</div>`;
+  
+  // Recommendation
+  if (comp.recommendation) {
+    html += `<div class="comparison-recommendation">`;
+    html += `<strong>💡 Рекомендация:</strong><br>${comp.recommendation}`;
+    html += `</div>`;
+  }
+  
+  div.innerHTML = html;
+  content.appendChild(div);
+  
+  // Обновляем состояние кнопок
+  const prevBtn = document.getElementById("prevComparisonBtn");
+  const nextBtn = document.getElementById("nextComparisonBtn");
+  if (prevBtn) prevBtn.disabled = window.currentComparisonIndex === 0;
+  if (nextBtn) nextBtn.disabled = window.currentComparisonIndex === window.comparisonsArray.length - 1;
+}
+
+// Обновляем счётчик
+function updateComparisonCounter() {
+  const counter = document.getElementById("comparisonCounter");
+  if (counter) {
+    const total = window.comparisonsArray ? window.comparisonsArray.length : 0;
+    const current = total > 0 ? window.currentComparisonIndex + 1 : 0;
+    counter.textContent = `${current}/${total}`;
   }
 }
+
+// Навигация по карусели
+function nextComparisonSlide() {
+  if (window.currentComparisonIndex < window.comparisonsArray.length - 1) {
+    window.currentComparisonIndex++;
+    renderComparisonSlide();
+    updateComparisonCounter();
+  }
+}
+
+function prevComparisonSlide() {
+  if (window.currentComparisonIndex > 0) {
+    window.currentComparisonIndex--;
+    renderComparisonSlide();
+    updateComparisonCounter();
+  }
+}
+
+// Инициализация кнопок карусели сравнений
+document.addEventListener("DOMContentLoaded", function() {
+  const prevBtn = document.getElementById("prevComparisonBtn");
+  const nextBtn = document.getElementById("nextComparisonBtn");
+  
+  if (prevBtn) prevBtn.addEventListener("click", prevComparisonSlide);
+  if (nextBtn) nextBtn.addEventListener("click", nextComparisonSlide);
+});
+
+// ===== КАРУСЕЛЬ СРАВНЕНИЙ =====
+let currentComparisonIndex = 0;
+let comparisonsArray = [];
+
+function initComparisonCarousel(data) {
+  comparisonsArray = Object.entries(data.best_offers_comparison || {});
+  currentComparisonIndex = 0;
+  
+  if (comparisonsArray.length > 0) {
+    renderComparisonCarousel();
+  }
+}
+
+function renderComparisonCarousel() {
+  const content = document.getElementById("bestComparisonContent");
+  if (!content || comparisonsArray.length === 0) return;
+
+  const [analogName, comp] = comparisonsArray[currentComparisonIndex];
+  const data = window.lastAnalysisData; // сохраняем данные глобально
+
+  content.innerHTML = `<h3 style="margin: 0 0 12px 0; font-size: 16px; color: var(--text); font-weight: 600; padding-bottom: 12px; border-bottom: 1px solid var(--border);">🎪 Сравнение лучших объявлений</h3>`;
+
+  const div = document.createElement("div");
+  div.className = "comparison-item";
+
+  let html = `<div class="comparison-header">
+    <div><strong>${data.vendor || "Оригинал"}</strong> vs <strong>${analogName}</strong></div>
+    <div class="comparison-winner">${comp.winner === "original" ? "✅ Оригинал" : "🏆 " + analogName}</div>
+  </div>`;
+
+  html += `<div class="comparison-scores">
+    <div class="comparison-score">Оригинал: ${comp.original_score ? comp.original_score.toFixed(1) : 0}</div>
+    <div class="comparison-score">Аналог: ${comp.analog_score ? comp.analog_score.toFixed(1) : 0}</div>
+  </div>`;
+
+  // Links
+  html += `<div class="comparison-links">`;
+  if (comp.original_url) {
+    html += `<div class="offer-link"><strong>🔗 Оригинал:</strong> <a href="${comp.original_url}" target="_blank">${comp.original_title || comp.original_url}</a></div>`;
+  }
+  if (comp.analog_url) {
+    html += `<div class="offer-link"><strong>🔗 Аналог:</strong> <a href="${comp.analog_url}" target="_blank">${comp.analog_title || comp.analog_url}</a></div>`;
+  }
+  html += `</div>`;
+
+  // Детали, различия, цена, плюсы/минусы
+  if (comp.comparison_details) {
+    html += `<div class="comparison-details"><h4>📊 Сравнение</h4>`;
+    if (comp.comparison_details.price) html += `<div class="detail-item"><strong>Цена:</strong> ${comp.comparison_details.price}</div>`;
+    if (comp.comparison_details.quality) html += `<div class="detail-item"><strong>Качество:</strong> ${comp.comparison_details.quality}</div>`;
+    html += `</div>`;
+  }
+
+  if (comp.key_differences && comp.key_differences.length > 0) {
+    html += `<div class="key-differences"><h4>⭐ Отличия</h4><ul>`;
+    comp.key_differences.forEach(d => html += `<li>${d}</li>`);
+    html += `</ul></div>`;
+  }
+
+  if (comp.price_comparison) {
+    const pc = comp.price_comparison;
+    html += `<div class="comparison-price"><strong>💰 Цена:</strong> ${pc.original_price ? pc.original_price.toLocaleString("ru-RU") : "—"} vs ${pc.analog_price ? pc.analog_price.toLocaleString("ru-RU") : "—"}</div>`;
+  }
+
+  html += `<div class="comparison-pros-cons">`;
+  if (comp.pros_original?.length) {
+    html += `<div class="comparison-pros"><h4>✅ Плюсы оригинала</h4><ul>`;
+    comp.pros_original.slice(0, 3).forEach(p => html += `<li>✓ ${p}</li>`);
+    html += `</ul></div>`;
+  }
+  if (comp.cons_original?.length) {
+    html += `<div class="comparison-cons"><h4>❌ Минусы оригинала</h4><ul>`;
+    comp.cons_original.slice(0, 3).forEach(c => html += `<li>✗ ${c}</li>`);
+    html += `</ul></div>`;
+  }
+  html += `</div>`;
+
+  if (comp.recommendation) {
+    html += `<div class="comparison-recommendation"><strong>💡 Рекомендация:</strong><br>${comp.recommendation}</div>`;
+  }
+
+  div.innerHTML = html;
+  content.appendChild(div);
+
+  // Счётчик
+  const counter = document.getElementById("comparisonCounter");
+  if (counter) {
+    counter.textContent = `${currentComparisonIndex + 1}/${comparisonsArray.length}`;
+  }
+}
+
+function nextComparison() {
+  if (currentComparisonIndex < comparisonsArray.length - 1) {
+    currentComparisonIndex++;
+    renderComparisonCarousel();
+  }
+}
+
+function prevComparison() {
+  if (currentComparisonIndex > 0) {
+    currentComparisonIndex--;
+    renderComparisonCarousel();
+  }
+}
+
+// Инициализация кнопок карусели
+document.addEventListener("DOMContentLoaded", function() {
+  const prevCompBtn = document.getElementById("prevComparisonBtn");
+  const nextCompBtn = document.getElementById("nextComparisonBtn");
+  
+  if (prevCompBtn) prevCompBtn.addEventListener("click", prevComparison);
+  if (nextCompBtn) nextCompBtn.addEventListener("click", nextComparison);
+});
 
 // ===== RENDER ALL OFFERS =====
 function renderAllOffers(sources) {

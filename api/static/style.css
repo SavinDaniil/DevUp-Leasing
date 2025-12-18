@@ -287,6 +287,27 @@ input[type="number"]:focus {
     flex-direction: column;
 }
 
+/* НОВОЕ - для кнопки "Развернуть анализ аналогов" */
+
+.toggle-analogs-btn {
+    margin-bottom: 12px;
+    padding: 10px 16px;
+    background: rgba(34, 197, 94, 0.2);
+    border: 1px solid var(--accent);
+    border-radius: 8px;
+    color: var(--text);
+    cursor: pointer;
+    font-size: 13px;
+    transition: all 0.2s;
+    font-weight: 600;
+}
+
+.toggle-analogs-btn:hover {
+    background: rgba(34, 197, 94, 0.3);
+    transform: translateY(-1px);
+}
+
+
 .analog-card {
     flex: 1;
     padding: 14px;
