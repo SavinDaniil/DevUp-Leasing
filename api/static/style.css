@@ -187,16 +187,23 @@ input[type="number"]:focus {
     margin-top: 10px;
     font-size: 14px;
     color: var(--muted);
-    display: none;
+    display: none;  
 }
 
 .loading.show {
-    display: block;
+    display: flex;
+    align-items: center;
 }
 
 .gear {
-    display: inline-block;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    font-size: 18px;
     margin-right: 6px;
+    transform-origin: 50% 50%; 
     animation: gear-spin 1s linear infinite;
 }
 
@@ -401,6 +408,10 @@ input[type="number"]:focus {
     border-top: 1px solid var(--border);
 }
 
+.best-offer-section h3 {
+    font-size: 16px;
+}
+
 .best-offer-section.hidden {
     display: none;
 }
@@ -418,6 +429,16 @@ input[type="number"]:focus {
     font-weight: 600;
     margin-bottom: 8px;
     color: var(--accent);
+}
+
+.best-offer-link {
+    color: var(--accent);
+    font-size: 13px;
+    text-decoration: none;
+}
+
+.best-offer-link:hover {
+    text-decoration: underline;
 }
 
 .best-offer-url {
@@ -459,6 +480,10 @@ input[type="number"]:focus {
     margin-top: 20px;
     padding-top: 16px;
     border-top: 1px solid var(--border);
+}
+
+.comparison-section h3 {
+    font-size: 16px;
 }
 
 .comparison-section.hidden {
