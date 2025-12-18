@@ -111,6 +111,9 @@ function validateForm() {
   return true;
 }
 
+<<<<<<< Updated upstream
+>>>>>>> Stashed changes
+=======
 >>>>>>> Stashed changes
 // ===== ОТПРАВКА ФОРМЫ =====
 form.addEventListener("submit", async (e) => {
@@ -143,13 +146,19 @@ form.addEventListener("submit", async (e) => {
 
   try {
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
     console.log("[DEBUG] Отправляем запрос на /api/describe");
 
 =======
+=======
+>>>>>>> Stashed changes
     // Таймаут для запроса (5 минут)
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 300000);
     
+<<<<<<< Updated upstream
+>>>>>>> Stashed changes
+=======
 >>>>>>> Stashed changes
     const resp = await fetch("/api/describe", {
       method: "POST",
@@ -164,6 +173,7 @@ form.addEventListener("submit", async (e) => {
     });
     
     clearTimeout(timeoutId);
+<<<<<<< Updated upstream
 
     console.log("[DEBUG] Ответ получен, статус:", resp.status);
 
@@ -173,6 +183,10 @@ form.addEventListener("submit", async (e) => {
       console.error("[ERROR] Ответ ошибки:", errText);
       throw new Error("Ошибка сервера: " + resp.status);
 =======
+=======
+
+    if (!resp.ok) {
+>>>>>>> Stashed changes
       let errorMessage = "Ошибка сервера";
       try {
         const errorData = await resp.json();
@@ -193,6 +207,9 @@ form.addEventListener("submit", async (e) => {
       }
       
       throw new Error(errorMessage);
+<<<<<<< Updated upstream
+>>>>>>> Stashed changes
+=======
 >>>>>>> Stashed changes
     }
 
@@ -225,12 +242,15 @@ form.addEventListener("submit", async (e) => {
     }
   } catch (err) {
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
     console.error("[ERROR]", err.message);
     loading.classList.remove("show");
     placeholder.classList.remove("hidden");
     error.classList.add("show");
     error.textContent = "Ошибка: " + err.message;
 =======
+=======
+>>>>>>> Stashed changes
     console.error("[ERROR]", err);
     stopLoadingAnimation();
     loading.classList.remove("show");
@@ -247,6 +267,9 @@ form.addEventListener("submit", async (e) => {
     } else {
       error.textContent = "❌ Произошла неизвестная ошибка. Пожалуйста, попробуйте позже.";
     }
+<<<<<<< Updated upstream
+>>>>>>> Stashed changes
+=======
 >>>>>>> Stashed changes
   } finally {
     form.querySelector("button").disabled = false;

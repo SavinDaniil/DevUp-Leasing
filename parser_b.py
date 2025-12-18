@@ -2797,6 +2797,9 @@ def collect_analogs(
         logger.error(f"[SONAR] Error during Sonar search: {e}")
         logger.error("[SONAR] Cannot proceed without Sonar - no fallback methods available")
         return [], []
+<<<<<<< Updated upstream
+>>>>>>> Stashed changes
+=======
 >>>>>>> Stashed changes
 
 
@@ -3590,9 +3593,12 @@ def run_pipeline(params: UserInput) -> tuple[list[LeasingOffer], dict, list[dict
                     logger.info(f"Enriched {enriched_count} offers with technical specifications")
 
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
         # Collect analogs
         analogs = collect_analogs(item, offers, use_ai=use_ai, analyzer=analyzer)
 =======
+=======
+>>>>>>> Stashed changes
         # Collect analogs (ONLY Sonar - no fallback methods)
         analogs, sonar_analog_details = collect_analogs(
             item, offers, use_ai=use_ai, analyzer=analyzer, sonar_finder=sonar_finder
@@ -3675,6 +3681,10 @@ def run_pipeline(params: UserInput) -> tuple[list[LeasingOffer], dict, list[dict
                 avg_price_math = int(sum(price_list) / len(price_list)) if price_list else None
                 
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
+=======
+                # Use Sonar info if available (ONLY Sonar - no fallback)
+>>>>>>> Stashed changes
 =======
                 # Use Sonar info if available (ONLY Sonar - no fallback)
 >>>>>>> Stashed changes
@@ -3704,6 +3714,9 @@ def run_pipeline(params: UserInput) -> tuple[list[LeasingOffer], dict, list[dict
                 else:
                     # Если Sonar info нет - оставляем пустые значения (нет fallback)
                     logger.warning(f"[SONAR] No Sonar info for {analog} - pros/cons will be empty")
+<<<<<<< Updated upstream
+>>>>>>> Stashed changes
+=======
 >>>>>>> Stashed changes
                 
                 final_price = price_hint if price_hint else avg_price_math
@@ -3815,6 +3828,9 @@ def run_pipeline(params: UserInput) -> tuple[list[LeasingOffer], dict, list[dict
             if not sonar_finder or not sonar_finder.is_available():
                 logger.error("[SONAR] Sonar not available - cannot perform comparisons without Sonar")
                 logger.error("[SONAR] No comparisons will be performed")
+<<<<<<< Updated upstream
+>>>>>>> Stashed changes
+=======
 >>>>>>> Stashed changes
             
             report["best_offers_comparison"] = comparisons
