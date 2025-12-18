@@ -77,6 +77,17 @@ adapter = HTTPAdapter(
 _requests_session.mount("http://", adapter)
 _requests_session.mount("https://", adapter)
 
+# Отдельная сессия для Sonar БЕЗ автоматических retry (чтобы наша логика retry работала)
+_sonar_requests_session = requests.Session()
+# Создаем адаптер БЕЗ retry для Sonar
+sonar_adapter = HTTPAdapter(
+    pool_connections=5,
+    pool_maxsize=10,
+    max_retries=0  # Отключаем автоматические retry - используем нашу логику
+)
+_sonar_requests_session.mount("http://", sonar_adapter)
+_sonar_requests_session.mount("https://", sonar_adapter)
+
 
 # =============================
 # Configuration
@@ -1322,6 +1333,663 @@ class AIAnalyzer:
 
 
 # =============================
+<<<<<<< Updated upstream
+=======
+# Sonar Analog Finder (Perplexity API)
+# =============================
+class SonarAnalogFinder:
+    """
+    Находит аналоги через Perplexity Sonar API.
+    Оптимизирован для минимального расхода токенов.
+    """
+    
+    # Улучшенный промпт для поиска аналогов
+    ANALOG_PROMPT = """Используй данные из поисковых результатов для поиска РОВНО 3 лучших конкурентных аналога для: {item}
+
+Требования к аналогам:
+1. Тот же тип продукта (если авто - то авто того же класса, если техника - то аналогичная техника)
+2. Сопоставимый ценовой сегмент (+-30%)
+3. Доступны для покупки в России в 2024-2025 году
+4. Популярные и проверенные модели с хорошими отзывами
+
+Для каждого аналога укажи:
+- Точное название (производитель + модель)
+- Реальный диапазон цен в рублях (на основе данных из поисковых результатов)
+- Главное отличие от оригинала
+
+ВАЖНО: Используй информацию из предоставленных поисковых результатов. Если информации недостаточно, используй свои знания о рынке.
+
+КРИТИЧЕСКИ ВАЖНО: 
+- Верни ТОЛЬКО валидный JSON, без дополнительного текста до или после
+- Не добавляй объяснений, комментариев или markdown разметки (включая ```json)
+- Формат ответа должен быть строго JSON объект, начинающийся с {{ и заканчивающийся }}
+
+{{"analogs": [
+  {{"name": "Производитель Модель", "price_range": "X-Y млн руб", "key_diff": "главное отличие"}},
+  {{"name": "Производитель Модель", "price_range": "X-Y млн руб", "key_diff": "главное отличие"}},
+  {{"name": "Производитель Модель", "price_range": "X-Y млн руб", "key_diff": "главное отличие"}}
+]}}"""
+
+    # Улучшенный промпт для сравнения объявлений
+    COMPARE_PROMPT = """Используй данные из поисковых результатов для сравнения двух объявлений:
+
+ОРИГИНАЛ - {original_name}:
+- Объявление: {original_title}
+- Цена: {original_price}
+- Ссылка: {original_url}
+
+АНАЛОГ - {analog_name}:
+- Объявление: {analog_title}
+- Цена: {analog_price}
+- Ссылка: {analog_url}
+
+Проанализируй оба варианта по следующим критериям:
+- Цена и соотношение цена/качество
+- Технические характеристики и комплектация
+- Надежность и репутация бренда
+- Доступность запчастей и сервиса в России
+- Условия покупки и лизинга
+
+ВАЖНО: Используй информацию из предоставленных поисковых результатов для обоих автомобилей. Если информации о конкретном объявлении недостаточно, используй общие данные о модели из поисковых результатов.
+
+КРИТИЧЕСКИ ВАЖНО:
+- Верни ТОЛЬКО валидный JSON, без дополнительного текста до или после
+- Не добавляй объяснений, комментариев или markdown разметки (включая ```json)
+- Формат ответа должен быть строго JSON объект, начинающийся с {{ и заканчивающийся }}
+- Если информации недостаточно, все равно верни JSON с доступными данными
+
+{{"winner": "original" или "analog" или "tie",
+"orig_pros": ["конкретный плюс 1", "конкретный плюс 2"],
+"orig_cons": ["конкретный минус 1"],
+"analog_pros": ["конкретный плюс 1", "конкретный плюс 2"],
+"analog_cons": ["конкретный минус 1"],
+"price_diff": "Аналог дешевле/дороже на X% или примерно равно",
+"verdict": "Четкая рекомендация что выбрать и почему (2-3 предложения)"}}"""
+
+    def __init__(self):
+        self.api_key = CONFIG.perplexity_api_key
+        
+        # Определяем URL API: если указан base_url (прокси), используем его, иначе прямой API
+        # Также проверяем ключ: если начинается с sk-, вероятно это прокси
+        base_url = CONFIG.sonar_base_url
+        
+        # Если base_url не указан, но ключ начинается с sk-, предполагаем прокси artemox
+        if not base_url and self.api_key and self.api_key.startswith("sk-"):
+            base_url = "https://api.artemox.com/v1"
+            logger.info("[SONAR] Detected proxy API (artemox.com) based on key format")
+        
+        if base_url:
+            # Прокси через artemox.com или другой сервис
+            self.api_url = f"{base_url.rstrip('/')}/chat/completions"
+            # Для прокси пробуем разные модели (некоторые прокси не поддерживают sonar-reasoning)
+            # Список моделей для попытки в порядке приоритета
+            user_model = os.getenv("PERPLEXITY_MODEL")
+            # Если пользователь не указал модель, используем sonar-reasoning-pro по умолчанию (как в примере)
+            if not user_model:
+                user_model = "sonar-reasoning-pro"
+            
+            self.model_candidates = [
+                user_model,  # Пользовательская модель из .env или "sonar-reasoning-pro" по умолчанию
+                "sonar",  # Fallback на sonar (более легкая модель)
+                "gpt-4",  # Fallback на GPT-4
+                "gpt-3.5-turbo"  # Последний fallback
+            ]
+            # Убираем дубликаты и None из списка
+            seen = set()
+            self.model_candidates = [m for m in self.model_candidates if m and m not in seen and not seen.add(m)]
+            # Начинаем с первой доступной модели
+            self.model = self.model_candidates[0] if self.model_candidates else "sonar-reasoning-pro"
+            self.current_model_index = 0
+            logger.info(f"[SONAR] Using proxy API: {self.api_url} with model: {self.model}")
+            logger.info(f"[SONAR] Available model fallbacks: {', '.join(self.model_candidates)}")
+        else:
+            # Прямой Perplexity API
+            self.api_url = CONFIG.sonar_api_url
+            self.model = CONFIG.sonar_model
+            logger.info(f"[SONAR] Using direct Perplexity API: {self.api_url} with model: {self.model}")
+        
+    def is_available(self) -> bool:
+        """Check if Sonar API is available."""
+        # Accept keys starting with 'pplx-' (Perplexity) or 'sk-' (proxy services like artemox)
+        return bool(self.api_key and (self.api_key.startswith("pplx-") or self.api_key.startswith("sk-")))
+    
+    def _call_sonar(self, prompt: str, max_tokens: int = 400, retries: int = 2) -> Optional[dict]:
+        """
+        Make a call to Sonar API with minimal tokens.
+        Includes retry logic for 500 errors and timeouts.
+        """
+        if not self.api_key:
+            return None
+        
+        # Увеличиваем таймаут для прокси (они могут быть медленнее)
+        # В примере используется timeout=600 (10 минут), но для нашего случая 300 секунд (5 минут) должно быть достаточно
+        timeout = 300 if "artemox.com" in self.api_url else CONFIG.http_long_timeout
+        
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        # Формируем payload в зависимости от типа API
+        # Для прокси (artemox.com) используем МИНИМАЛЬНЫЙ набор параметров (как в примере)
+        if "artemox.com" in self.api_url or hasattr(self, 'model_candidates'):
+            # Минимальный payload для прокси - ТОЛЬКО model и messages (как в примере)
+            # НЕ добавляем max_tokens и temperature, т.к. прокси может их не поддерживать
+            payload = {
+                "model": self.model,  # Используем текущую модель (может быть изменена при ошибке)
+                "messages": [{"role": "user", "content": prompt}]
+            }
+            # НЕ добавляем дополнительные параметры для прокси - используем минимальный формат
+        else:
+            # Для прямого Perplexity API полный набор параметров
+            payload = {
+                "model": self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "temperature": 0.1,
+                "return_citations": False,
+                "return_images": False
+            }
+        
+        # Retry логика для 500 ошибок и таймаутов
+        for attempt in range(retries + 1):
+            try:
+                sonar_rate_limiter.wait_if_needed()
+                
+                # Логируем детали запроса для отладки (только для прокси)
+                if "artemox.com" in self.api_url and attempt == 0:
+                    logger.info(f"[SONAR] Sending request to {self.api_url}")
+                    logger.info(f"[SONAR] Model: {self.model}")
+                    logger.debug(f"[SONAR] Payload: {json.dumps(payload, ensure_ascii=False)[:300]}...")
+                
+                # Используем отдельную сессию для Sonar без автоматических retry
+                response = _sonar_requests_session.post(
+                    self.api_url,
+                    headers=headers,
+                    json=payload,
+                    timeout=timeout
+                )
+                
+                # Логируем ответ для отладки
+                if response.status_code != 200:
+                    try:
+                        error_body = response.text[:200]  # Первые 200 символов ошибки
+                        logger.warning(f"[SONAR] Response status {response.status_code}: {error_body}")
+                    except:
+                        pass
+                
+                # Handle 401 Unauthorized - invalid or missing API key
+                if response.status_code == 401:
+                    logger.error("[SONAR] 401 Unauthorized - Invalid or missing PERPLEXITY_API_KEY")
+                    logger.error("[SONAR] Please check your .env file and ensure PERPLEXITY_API_KEY is set correctly")
+                    logger.error("[SONAR] Key should start with 'pplx-' or 'sk-' (without quotes)")
+                    return None
+                
+                # Handle 500 errors - может быть из-за неподдерживаемой модели
+                if response.status_code == 500:
+                    # Проверяем, не связана ли ошибка с моделью
+                    try:
+                        error_data = response.json()
+                        error_msg = str(error_data.get("error", {}).get("message", "")).lower()
+                        # Если ошибка связана с моделью, пробуем другую
+                        if "model" in error_msg or "guardrail" in error_msg or "dissalowed" in error_msg:
+                            if hasattr(self, 'model_candidates') and self.current_model_index < len(self.model_candidates) - 1:
+                                self.current_model_index += 1
+                                self.model = self.model_candidates[self.current_model_index]
+                                payload["model"] = self.model
+                                logger.warning(f"[SONAR] Model not allowed, switching to: {self.model}")
+                                continue
+                    except:
+                        pass
+                    
+                    if attempt < retries:
+                        wait_time = (attempt + 1) * 3  # 3, 6, 9 секунд
+                        logger.warning(f"[SONAR] 500 Internal Server Error from {self.api_url}")
+                        logger.warning(f"[SONAR] This usually means the proxy server is overloaded or having issues")
+                        logger.warning(f"[SONAR] Retrying in {wait_time}s (attempt {attempt + 1}/{retries + 1})...")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        logger.error(f"[SONAR] 500 error persisted after {retries + 1} attempts")
+                        logger.error(f"[SONAR] Proxy server {self.api_url} may be temporarily unavailable")
+                        logger.error("[SONAR] System will use fallback methods (GigaChat/Google)")
+                        return None
+                
+                response.raise_for_status()
+                
+                data = response.json()
+                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                
+                # Логируем сырой ответ для отладки (первые 500 символов)
+                if not content:
+                    logger.warning(f"[SONAR] Empty content in API response. Full response keys: {list(data.keys())}")
+                    logger.debug(f"[SONAR] Full response structure: {str(data)[:500]}")
+                    return None
+                
+                logger.debug(f"[SONAR] Received content length: {len(content)} chars")
+                logger.debug(f"[SONAR] Content preview: {content[:200]}...")
+                
+                # Parse JSON from response
+                parsed = safe_json_loads(content)
+                if not parsed:
+                    logger.warning(f"[SONAR] Failed to parse JSON from content. Content preview: {content[:500]}")
+                else:
+                    logger.debug(f"[SONAR] Successfully parsed JSON. Keys: {list(parsed.keys()) if isinstance(parsed, dict) else 'not a dict'}")
+                
+                return parsed
+                
+            except requests.Timeout as e:
+                if attempt < retries:
+                    wait_time = (attempt + 1) * 2
+                    logger.warning(f"[SONAR] Timeout, retrying in {wait_time}s (attempt {attempt + 1}/{retries + 1})...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(f"[SONAR] Timeout after {retries + 1} attempts: {e}")
+                    return None
+            except requests.HTTPError as e:
+                if e.response and e.response.status_code == 401:
+                    logger.error("[SONAR] Authentication failed - check PERPLEXITY_API_KEY in .env file")
+                    return None
+                if e.response and e.response.status_code == 500:
+                    # Проверяем, не связана ли ошибка с моделью
+                    try:
+                        error_data = e.response.json()
+                        error_msg = str(error_data.get("error", {}).get("message", "")).lower()
+                        if ("model" in error_msg or "guardrail" in error_msg or "dissalowed" in error_msg) and \
+                           hasattr(self, 'model_candidates') and self.current_model_index < len(self.model_candidates) - 1:
+                            self.current_model_index += 1
+                            self.model = self.model_candidates[self.current_model_index]
+                            payload["model"] = self.model
+                            logger.warning(f"[SONAR] Model error detected, switching to: {self.model}")
+                            continue
+                    except:
+                        pass
+                    
+                    if attempt < retries:
+                        wait_time = (attempt + 1) * 3
+                        logger.warning(f"[SONAR] HTTP 500 error, retrying in {wait_time}s...")
+                        time.sleep(wait_time)
+                        continue
+                logger.warning(f"[SONAR] HTTP error: {e}")
+                return None
+            except requests.RequestException as e:
+                # Обрабатываем ResponseError от HTTPAdapter (too many 500 errors)
+                error_str = str(e).lower()
+                is_retryable = (
+                    "500" in error_str or 
+                    "timeout" in error_str or 
+                    "too many" in error_str or
+                    "connection" in error_str
+                )
+                
+                if attempt < retries and is_retryable:
+                    wait_time = (attempt + 1) * 3  # Увеличиваем задержку для 500 ошибок
+                    logger.warning(f"[SONAR] Request error (retryable), retrying in {wait_time}s: {e}")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.warning(f"[SONAR] Request error (non-retryable or max retries): {e}")
+                    if "too many 500" in error_str:
+                        logger.error("[SONAR] Proxy server is returning too many 500 errors")
+                        logger.error("[SONAR] This may indicate server overload or temporary unavailability")
+                        logger.error("[SONAR] Will use fallback methods (GigaChat/Google)")
+                    return None
+            except Exception as e:
+                logger.warning(f"[SONAR] Parse error: {e}")
+                return None
+        
+        return None
+    
+    def find_analogs(self, item_name: str) -> list[SonarAnalogResult]:
+        """
+        Найти РОВНО 3 аналога через Sonar.
+        Возвращает список из 3 аналогов с описанием.
+        """
+        if not self.is_available():
+            logger.warning("[SONAR] API not available - PERPLEXITY_API_KEY not set or invalid format")
+            logger.warning("[SONAR] Key should start with 'pplx-' or 'sk-'")
+            return []
+        
+        logger.info(f"[SONAR] Searching for 3 analogs for: {item_name}")
+        
+        try:
+            prompt = self.ANALOG_PROMPT.format(item=item_name)
+            # Увеличиваем max_tokens для поиска аналогов (нужно больше контекста)
+            result = self._call_sonar(prompt, max_tokens=800, retries=3)
+            
+            if not result:
+                logger.warning("[SONAR] Failed to get analogs from API response - _call_sonar returned None")
+                logger.warning("[SONAR] Possible reasons: timeout, 500 error, invalid API key, or JSON parse error")
+                logger.warning("[SONAR] Will use fallback methods (GigaChat/Google)")
+                return []
+            
+            if "analogs" not in result:
+                logger.warning(f"[SONAR] API response doesn't contain 'analogs' key")
+                logger.warning(f"[SONAR] Response keys: {list(result.keys()) if isinstance(result, dict) else 'not a dict'}")
+                logger.warning(f"[SONAR] Response preview: {str(result)[:500]}")
+                logger.warning("[SONAR] Will use fallback methods (GigaChat/Google)")
+                return []
+        except Exception as e:
+            logger.error(f"[SONAR] Exception during analog search: {e}")
+            logger.info("[SONAR] Falling back to GigaChat/Google methods")
+            return []
+        
+        raw_analogs = result.get("analogs", [])
+        if not raw_analogs:
+            logger.warning("[SONAR] No analogs in API response")
+            return []
+        
+        # Обрабатываем результаты
+        analogs = []
+        for a in raw_analogs[:3]:  # Берем максимум 3
+            name = a.get("name", "").strip()
+            if name:  # Только если есть название
+                analogs.append({
+                    "name": name,
+                    "description": a.get("key_diff", "") or a.get("description", ""),
+                    "price_range": a.get("price_range", ""),
+                    "key_difference": a.get("key_diff", "") or a.get("key_difference", "")
+                })
+        
+        # Если получили меньше 3, логируем предупреждение
+        if len(analogs) < 3:
+            logger.warning(f"[SONAR] Got only {len(analogs)} analogs instead of 3")
+        
+        if analogs:
+            logger.info(f"[SONAR] Found {len(analogs)} analogs: {', '.join([a['name'] for a in analogs])}")
+        else:
+            logger.warning("[SONAR] No valid analogs found")
+        
+        return analogs
+    
+    def compare_offers(
+        self, 
+        original_name: str,
+        original_offer: dict,
+        analog_name: str, 
+        analog_offer: dict
+    ) -> SonarComparisonResult:
+        """
+        Сравнить конкретные объявления оригинала и аналога через Sonar.
+        Включает ссылки на объявления.
+        
+        Args:
+            original_name: Название оригинальной модели
+            original_offer: Dict с данными объявления (title, price, url)
+            analog_name: Название аналога
+            analog_offer: Dict с данными объявления аналога
+        """
+        if not self.is_available():
+            return {"winner": "unknown", "recommendation": "Sonar unavailable"}
+        
+        # Извлекаем данные объявлений
+        orig_title = original_offer.get("title", original_name)
+        orig_price = original_offer.get("price")
+        orig_url = original_offer.get("url", "")
+        
+        analog_title = analog_offer.get("title", analog_name)
+        analog_price = analog_offer.get("price")
+        analog_url = analog_offer.get("url", "")
+        
+        logger.info(f"[SONAR] Comparing offers: {orig_title[:50]}... vs {analog_title[:50]}...")
+        
+        orig_price_str = format_price(orig_price) if orig_price else "цена не указана"
+        analog_price_str = format_price(analog_price) if analog_price else "цена не указана"
+        
+        prompt = self.COMPARE_PROMPT.format(
+            original_name=original_name,
+            original_title=orig_title[:100],
+            original_price=orig_price_str,
+            original_url=orig_url,
+            analog_name=analog_name,
+            analog_title=analog_title[:100],
+            analog_price=analog_price_str,
+            analog_url=analog_url
+        )
+        
+        # Увеличиваем retries для сравнений (важная операция)
+        result = self._call_sonar(prompt, max_tokens=600, retries=3)
+        
+        if not result:
+            logger.warning(f"[SONAR] Comparison failed for {original_name} vs {analog_name}")
+            return {
+                "winner": "unknown", 
+                "recommendation": "Сравнение через Sonar не удалось (ошибка API или таймаут)",
+                "original_url": orig_url,
+                "analog_url": analog_url,
+                "original_title": orig_title,
+                "analog_title": analog_title
+            }
+        
+        return {
+            "winner": result.get("winner", "tie"),
+            "original_advantages": ensure_list_str(result.get("orig_pros", [])),
+            "original_disadvantages": ensure_list_str(result.get("orig_cons", [])),
+            "analog_advantages": ensure_list_str(result.get("analog_pros", [])),
+            "analog_disadvantages": ensure_list_str(result.get("analog_cons", [])),
+            "recommendation": result.get("verdict", ""),
+            "price_diff": result.get("price_diff", ""),
+            "price_verdict": result.get("price_diff", "similar"),
+            # Включаем ссылки на объявления
+            "original_url": orig_url,
+            "original_title": orig_title,
+            "original_price": orig_price,
+            "analog_url": analog_url,
+            "analog_title": analog_title,
+            "analog_price": analog_price,
+            "sonar_comparison": True
+        }
+    
+    # Промпт для выбора лучшего объявления из списка
+    FIND_BEST_OFFER_PROMPT = """Проанализируй список объявлений и выбери ЛУЧШЕЕ по соотношению цена/качество:
+
+{offers_list}
+
+Оцени каждое объявление по критериям:
+1. Цена и соотношение цена/качество
+2. Технические характеристики и комплектация
+3. Состояние (новый/б/у)
+4. Надежность источника объявления
+5. Полнота информации
+
+Верни ТОЛЬКО валидный JSON без дополнительного текста:
+{{"best_index": 0, "best_score": 8.5, "reason": "краткое объяснение", "ranking": [
+  {{"index": 0, "score": 8.5, "brief_reason": "лучшая цена и комплектация"}},
+  {{"index": 1, "score": 7.0, "brief_reason": "хорошее состояние, но дороже"}}
+]}}"""
+    
+    # Промпт для валидации рыночных цен
+    VALIDATE_MARKET_PRICES_PROMPT = """Проанализируй рыночные цены для {item_name}:
+
+- Диапазон цен: {min_price} - {max_price} руб
+- Медианная цена: {median_price} руб
+- Средняя цена: {mean_price} руб
+- Цена клиента: {client_price} руб (если указана)
+- Количество объявлений: {offers_count}
+
+Оцени:
+1. Корректность диапазона цен (нет ли аномально высоких/низких цен)
+2. Обоснованность медианной цены
+3. Если указана цена клиента - насколько она соответствует рынку
+
+Верни ТОЛЬКО валидный JSON:
+{{"is_valid": true, "explanation": "детальное объяснение рыночной ситуации", "anomalies": ["если есть аномалии"], "client_price_verdict": "fair/overpriced/underpriced"}}"""
+    
+    # Промпт для обогащения данных объявления
+    ENRICH_OFFER_PROMPT = """Дополни информацию об объявлении:
+
+Название: {title}
+Цена: {price}
+Описание: {description}
+
+Извлеки и дополни:
+1. Производитель (vendor)
+2. Модель (model)
+3. Год выпуска (year)
+4. Состояние (condition: новый/б/у/восстановленный)
+5. Ключевые характеристики (specs)
+6. Плюсы (pros) - до 5 пунктов
+7. Минусы (cons) - до 3 пунктов
+
+Верни ТОЛЬКО валидный JSON:
+{{"vendor": "...", "model": "...", "year": 2024, "condition": "новый", "specs": {{"key": "value"}}, "pros": ["..."], "cons": ["..."]}}"""
+    
+    def find_best_offer(self, offers: list[dict]) -> Optional[dict]:
+        """
+        Найти лучшее объявление из списка через Sonar.
+        
+        Args:
+            offers: Список объявлений в формате dict
+            
+        Returns:
+            Dict с best_index, best_score, reason, ranking или None при ошибке
+        """
+        if not self.is_available():
+            return None
+        
+        if not offers:
+            return {"best_index": -1, "best_score": 0.0, "reason": "No offers", "ranking": []}
+        
+        if len(offers) == 1:
+            return {"best_index": 0, "best_score": 8.0, "reason": "Only one offer", "ranking": [{"index": 0, "score": 8.0, "brief_reason": "Single offer"}]}
+        
+        # Форматируем объявления для промпта
+        offers_list = "\n\n".join([
+            f"Объявление {i}:\n{json.dumps(offer, ensure_ascii=False, default=str, indent=2)}"
+            for i, offer in enumerate(offers, 1)
+        ])
+        
+        prompt = self.FIND_BEST_OFFER_PROMPT.format(offers_list=offers_list)
+        
+        logger.info(f"[SONAR] Finding best offer from {len(offers)} offers...")
+        result = self._call_sonar(prompt, max_tokens=800, retries=2)
+        
+        if not result:
+            logger.warning("[SONAR] Failed to find best offer via Sonar")
+            return None
+        
+        # Проверяем наличие обязательных полей
+        if "best_index" not in result:
+            logger.warning(f"[SONAR] Invalid response format: missing best_index. Keys: {list(result.keys())}")
+            return None
+        
+        best_index = result.get("best_index", 0)
+        if not (0 <= best_index < len(offers)):
+            logger.warning(f"[SONAR] Invalid best_index {best_index}, using 0")
+            best_index = 0
+        
+        logger.info(f"[SONAR] Best offer selected: index {best_index}, score {result.get('best_score', 0):.1f}/10")
+        return result
+    
+    def validate_market_prices(
+        self,
+        item_name: str,
+        min_price: Optional[int],
+        max_price: Optional[int],
+        median_price: Optional[float],
+        mean_price: Optional[int],
+        client_price: Optional[int],
+        offers_count: int
+    ) -> Optional[dict]:
+        """
+        Валидировать и объяснить рыночные цены через Sonar.
+        
+        Returns:
+            Dict с is_valid, explanation, anomalies, client_price_verdict или None
+        """
+        if not self.is_available():
+            return None
+        
+        min_price_str = format_price(min_price) if min_price else "не указано"
+        max_price_str = format_price(max_price) if max_price else "не указано"
+        median_price_str = format_price(int(median_price)) if median_price else "не указано"
+        mean_price_str = format_price(mean_price) if mean_price else "не указано"
+        client_price_str = format_price(client_price) if client_price else "не указано"
+        
+        prompt = self.VALIDATE_MARKET_PRICES_PROMPT.format(
+            item_name=item_name,
+            min_price=min_price_str,
+            max_price=max_price_str,
+            median_price=median_price_str,
+            mean_price=mean_price_str,
+            client_price=client_price_str,
+            offers_count=offers_count
+        )
+        
+        logger.info(f"[SONAR] Validating market prices for {item_name}...")
+        result = self._call_sonar(prompt, max_tokens=500, retries=2)
+        
+        if not result:
+            logger.warning("[SONAR] Failed to validate market prices via Sonar")
+            return None
+        
+        return result
+    
+    def enrich_offer_data(self, title: str, price: Optional[int], description: str = "") -> Optional[dict]:
+        """
+        Обогатить данные объявления через Sonar (извлечь vendor, model, year, specs и т.д.).
+        
+        Returns:
+            Dict с vendor, model, year, condition, specs, pros, cons или None
+        """
+        if not self.is_available():
+            return None
+        
+        price_str = format_price(price) if price else "не указана"
+        desc = description[:500] if description else ""  # Ограничиваем длину
+        
+        prompt = self.ENRICH_OFFER_PROMPT.format(
+            title=title[:200],
+            price=price_str,
+            description=desc
+        )
+        
+        logger.debug(f"[SONAR] Enriching offer data for: {title[:50]}...")
+        result = self._call_sonar(prompt, max_tokens=400, retries=1)
+        
+        if not result:
+            logger.debug("[SONAR] Failed to enrich offer data via Sonar")
+            return None
+        
+        return result
+
+
+# Global Sonar instance
+_sonar_finder: Optional[SonarAnalogFinder] = None
+
+# Simple cache for Sonar results (session-based)
+_sonar_cache: dict = {}
+
+
+def get_sonar_finder() -> Optional[SonarAnalogFinder]:
+    """Get or create Sonar finder instance."""
+    global _sonar_finder
+    if _sonar_finder is None:
+        _sonar_finder = SonarAnalogFinder()
+    return _sonar_finder if _sonar_finder.is_available() else None
+
+
+def get_cached_sonar_analogs(item_name: str) -> Optional[list]:
+    """Get cached Sonar analogs if available."""
+    cache_key = item_name.lower().strip()
+    return _sonar_cache.get(f"analogs_{cache_key}")
+
+
+def cache_sonar_analogs(item_name: str, analogs: list) -> None:
+    """Cache Sonar analogs for the item."""
+    cache_key = item_name.lower().strip()
+    _sonar_cache[f"analogs_{cache_key}"] = analogs
+
+
+def clear_sonar_cache() -> None:
+    """Clear Sonar cache."""
+    global _sonar_cache
+    _sonar_cache = {}
+
+
+# =============================
+>>>>>>> Stashed changes
 # Generic Parser Strategy (after AIAnalyzer)
 # =============================
 class GenericParserStrategy(ParserStrategy):
@@ -2045,6 +2713,7 @@ def collect_analogs(
     item_name: str,
     offers: list[LeasingOffer],
     use_ai: bool,
+<<<<<<< Updated upstream
     analyzer: Optional[AIAnalyzer]
 ) -> list[str]:
     """Collect analog models from offers and AI suggestions."""
@@ -2072,6 +2741,63 @@ def collect_analogs(
                     analogs_set.add(candidate)
 
     return [a for a in analogs_set if a]
+=======
+    analyzer: Optional[AIAnalyzer],
+    sonar_finder: Optional[SonarAnalogFinder] = None
+) -> tuple[list[str], list[SonarAnalogResult]]:
+    """
+    Collect analog models using ONLY Sonar API.
+    Sonar always returns exactly 3 analogs.
+    
+    Returns:
+        Tuple of (analog_names, sonar_details)
+        - analog_names: List of analog names (from Sonar, max 3)
+        - sonar_details: Detailed info from Sonar
+    """
+    sonar_details: list[SonarAnalogResult] = []
+    
+    # Check cache first
+    cached_analogs = get_cached_sonar_analogs(item_name)
+    if cached_analogs:
+        logger.info(f"[SONAR] Using cached analogs for '{item_name}'")
+        analog_names = [a["name"] for a in cached_analogs if a.get("name")]
+        return analog_names[:3], cached_analogs[:3]
+    
+    # ONLY Sonar - no fallback methods
+    if not sonar_finder or not sonar_finder.is_available():
+        logger.error("=" * 70)
+        logger.error("[SONAR] Sonar not available - PERPLEXITY_API_KEY not set or invalid format (should start with 'pplx-' or 'sk-')")
+        logger.error("[SONAR] Cannot proceed without Sonar - no fallback methods available")
+        logger.error("=" * 70)
+        return [], []
+    
+    logger.info("=" * 70)
+    logger.info("[SONAR] Searching for analogs using Perplexity Sonar API (ONLY METHOD)")
+    logger.info("=" * 70)
+    
+    try:
+        sonar_details = sonar_finder.find_analogs(item_name)
+        
+        if sonar_details:
+            analog_names = [a["name"] for a in sonar_details if a.get("name")]
+            if analog_names:
+                logger.info(f"[SONAR] Successfully found {len(analog_names)} analogs via Sonar")
+                logger.info(f"[SONAR] Analogs: {', '.join(analog_names)}")
+                # Cache the results
+                cache_sonar_analogs(item_name, sonar_details[:3])
+                # Return exactly 3 (or as many as we have)
+                return analog_names[:3], sonar_details[:3]
+            else:
+                logger.warning("[SONAR] Sonar returned results but no valid analog names")
+                return [], []
+        else:
+            logger.warning("[SONAR] Sonar did not return any analogs")
+            return [], []
+    except Exception as e:
+        logger.error(f"[SONAR] Error during Sonar search: {e}")
+        logger.error("[SONAR] Cannot proceed without Sonar - no fallback methods available")
+        return [], []
+>>>>>>> Stashed changes
 
 
 def fetch_listing_summaries(query: str, top_n: int = 3) -> list[ListingSummary]:
@@ -2092,7 +2818,12 @@ def fetch_listing_summaries(query: str, top_n: int = 3) -> list[ListingSummary]:
     return summaries
 
 
-def analyze_market(item_name: str, offers: list[LeasingOffer], client_price: Optional[int]) -> dict:
+def analyze_market(
+    item_name: str,
+    offers: list[LeasingOffer],
+    client_price: Optional[int],
+    sonar_finder: Optional[SonarAnalogFinder] = None
+) -> dict:
     """Perform market analysis on collected offers."""
     prices = [o.price for o in offers if o.price is not None]
     
@@ -2177,6 +2908,43 @@ def analyze_market(item_name: str, offers: list[LeasingOffer], client_price: Opt
         result["explanation"] = (
             f"Market range {format_price(min_p)} – {format_price(max_p)}, median {format_price(median_p)}."
         )
+    
+    # Улучшаем объяснение через Sonar (если доступен)
+    if sonar_finder and sonar_finder.is_available():
+        try:
+            sonar_validation = sonar_finder.validate_market_prices(
+                item_name=item_name,
+                min_price=min_p,
+                max_price=max_p,
+                median_price=median_p,
+                mean_price=mean_p,
+                client_price=client_price,
+                offers_count=len(offers)
+            )
+            
+            if sonar_validation:
+                # Объединяем объяснение Sonar с базовым
+                sonar_explanation = sonar_validation.get("explanation", "")
+                if sonar_explanation:
+                    result["explanation"] = f"{result['explanation']} {sonar_explanation}"
+                
+                # Добавляем информацию об аномалиях
+                anomalies = sonar_validation.get("anomalies", [])
+                if anomalies:
+                    result["anomalies"] = anomalies
+                
+                # Обновляем verdict для цены клиента
+                client_verdict = sonar_validation.get("client_price_verdict")
+                if client_verdict and client_price:
+                    result["client_price_verdict"] = client_verdict
+                
+                result["sonar_validation"] = True
+                logger.info("[SONAR] Market prices validated via Sonar")
+        except Exception as e:
+            logger.warning(f"[SONAR] Error validating market prices: {e}")
+            result["sonar_validation"] = False
+    else:
+        result["sonar_validation"] = False
 
     return result
 
@@ -2622,10 +3390,12 @@ def find_best_offer_from_list(
     offers: list[LeasingOffer],
     analyzer: Optional[AIAnalyzer],
     use_ai: bool,
-    item_name: str
+    item_name: str,
+    sonar_finder: Optional[SonarAnalogFinder] = None
 ) -> tuple[Optional[LeasingOffer], dict]:
     """
     Find the best offer from a list by comparing all offers with each other.
+    Использует ТОЛЬКО Sonar API - без fallback методов.
     
     Returns:
         Tuple of (best_offer, comparison_result)
@@ -2634,32 +3404,37 @@ def find_best_offer_from_list(
         return None, {}
     
     if len(offers) == 1:
-        return offers[0], {"best_index": 0, "best_score": 8.0, "reason": "Only one offer"}
+        return offers[0], {"best_index": 0, "best_score": 8.0, "reason": "Only one offer", "sonar_used": False}
     
-    if not use_ai or not analyzer:
-        # Fallback: return offer with lowest price (if available)
-        priced_offers = [o for o in offers if o.price is not None]
-        if priced_offers:
-            best = min(priced_offers, key=lambda x: x.price)
-            return best, {"best_index": offers.index(best), "best_score": 7.0, "reason": "Lowest price (no AI)"}
-        return offers[0], {"best_index": 0, "best_score": 5.0, "reason": "First offer (no AI, no prices)"}
-    
-    logger.info(f"Comparing {len(offers)} offers to find the best one...")
-    
-    # Convert offers to dict format for AI
+    # Convert offers to dict format
     offers_dict = [asdict(o) for o in offers]
     
-    # Find best offer using AI
-    result = analyzer.find_best_offer(offers_dict)
+    # ONLY Sonar - no fallback
+    if not use_ai or not sonar_finder or not sonar_finder.is_available():
+        logger.error("[SONAR] Sonar not available - cannot find best offer without Sonar")
+        # Return first offer as fallback (simple fallback, not AI-based)
+        return offers[0], {"best_index": 0, "best_score": 5.0, "reason": "Sonar unavailable - using first offer", "sonar_used": False}
     
-    best_index = result.get("best_index", 0)
-    if 0 <= best_index < len(offers):
-        best_offer = offers[best_index]
-        logger.info(f"Best offer selected: {best_offer.title[:50]}... (score: {result.get('best_score', 0):.1f}/10)")
-        return best_offer, result
-    else:
-        logger.warning(f"Invalid best_index {best_index}, using first offer")
-        return offers[0], result
+    logger.info(f"[SONAR] Finding best offer from {len(offers)} offers using Sonar (ONLY METHOD)...")
+    try:
+        sonar_result = sonar_finder.find_best_offer(offers_dict)
+        if sonar_result and "best_index" in sonar_result:
+            best_index = sonar_result.get("best_index", 0)
+            if 0 <= best_index < len(offers):
+                best_offer = offers[best_index]
+                logger.info(f"[SONAR] Best offer selected: {best_offer.title[:50]}... (score: {sonar_result.get('best_score', 0):.1f}/10)")
+                sonar_result["sonar_used"] = True
+                return best_offer, sonar_result
+            else:
+                logger.error(f"[SONAR] Invalid best_index {best_index}, using first offer")
+                return offers[0], {"best_index": 0, "best_score": 5.0, "reason": "Invalid Sonar result", "sonar_used": False}
+        else:
+            logger.error("[SONAR] Sonar returned invalid result, using first offer")
+            return offers[0], {"best_index": 0, "best_score": 5.0, "reason": "Invalid Sonar result", "sonar_used": False}
+    except Exception as e:
+        logger.error(f"[SONAR] Error finding best offer via Sonar: {e}")
+        logger.error("[SONAR] Cannot proceed without Sonar - using first offer as fallback")
+        return offers[0], {"best_index": 0, "best_score": 5.0, "reason": f"Sonar error: {str(e)[:50]}", "sonar_used": False}
 
 
 def compare_best_offers_original_vs_analogs(
@@ -2743,6 +3518,21 @@ def run_pipeline(params: UserInput) -> tuple[list[LeasingOffer], dict, list[dict
     fetcher = SeleniumFetcher()
     cleaner = ContentCleaner()
     
+<<<<<<< Updated upstream
+=======
+    # Initialize Sonar for analog search (PRIMARY method)
+    sonar_finder = get_sonar_finder()
+    if sonar_finder:
+        logger.info("=" * 70)
+        logger.info("[SONAR] Perplexity Sonar API initialized - will be used as PRIMARY method for analog search")
+        logger.info("=" * 70)
+    else:
+        logger.warning("=" * 70)
+        logger.warning("[SONAR] Perplexity API not available - PERPLEXITY_API_KEY not set or invalid format (should start with 'pplx-' or 'sk-')")
+        logger.error("[SONAR] Cannot proceed without Sonar - no fallback methods available")
+        logger.warning("=" * 70)
+    
+>>>>>>> Stashed changes
     analyzer = None
     if use_ai and CONFIG.gigachat_auth_data:
         client = GigaChatClient(CONFIG.gigachat_auth_data)
@@ -2799,11 +3589,18 @@ def run_pipeline(params: UserInput) -> tuple[list[LeasingOffer], dict, list[dict
                 if enriched_count > 0:
                     logger.info(f"Enriched {enriched_count} offers with technical specifications")
 
+<<<<<<< Updated upstream
         # Collect analogs
         analogs = collect_analogs(item, offers, use_ai=use_ai, analyzer=analyzer)
+=======
+        # Collect analogs (ONLY Sonar - no fallback methods)
+        analogs, sonar_analog_details = collect_analogs(
+            item, offers, use_ai=use_ai, analyzer=analyzer, sonar_finder=sonar_finder
+        )
+>>>>>>> Stashed changes
         
         # Generate initial report
-        report = analyze_market(item, offers, client_price)
+        report = analyze_market(item, offers, client_price, sonar_finder=sonar_finder)
         report["analogs_suggested"] = analogs
 
         # Validate with AI
@@ -2831,7 +3628,8 @@ def run_pipeline(params: UserInput) -> tuple[list[LeasingOffer], dict, list[dict
                 offers=offers,
                 analyzer=analyzer,
                 use_ai=use_ai,
-                item_name=item
+                item_name=item,
+                sonar_finder=sonar_finder
             )
             report["best_original_offer"] = asdict(best_original_offer) if best_original_offer else None
             report["best_original_analysis"] = best_original_analysis
@@ -2865,7 +3663,8 @@ def run_pipeline(params: UserInput) -> tuple[list[LeasingOffer], dict, list[dict
                         offers=analog_offers,
                         analyzer=analyzer,
                         use_ai=use_ai,
-                        item_name=analog
+                        item_name=analog,
+                        sonar_finder=sonar_finder
                     )
                 
                 best_analog_offers.append((analog, best_analog_offer))
@@ -2875,10 +3674,15 @@ def run_pipeline(params: UserInput) -> tuple[list[LeasingOffer], dict, list[dict
                 price_list = [l["price_guess"] for l in listings if l.get("price_guess")]
                 avg_price_math = int(sum(price_list) / len(price_list)) if price_list else None
                 
+<<<<<<< Updated upstream
+=======
+                # Use Sonar info if available (ONLY Sonar - no fallback)
+>>>>>>> Stashed changes
                 pros, cons, note = [], [], ""
                 price_hint = None
                 best_link = None
 
+<<<<<<< Updated upstream
                 if use_ai and analyzer:
                     ai_review = analyzer.review_analog(analog, listings)
                     pros = ensure_list_str(ai_review.get("pros"))
@@ -2886,6 +3690,21 @@ def run_pipeline(params: UserInput) -> tuple[list[LeasingOffer], dict, list[dict
                     price_hint = ai_review.get("price_hint")
                     note = ai_review.get("note", "")
                     best_link = ai_review.get("best_link")
+=======
+                if sonar_info:
+                    # Use Sonar description as note
+                    note = sonar_info.get("description", "") or sonar_info.get("key_difference", "")
+                    # Parse price range from Sonar
+                    price_range_str = sonar_info.get("price_range", "")
+                    if price_range_str:
+                        note = f"{note} | Ценовой диапазон: {price_range_str}" if note else f"Ценовой диапазон: {price_range_str}"
+                    # Use Sonar pros/cons if available
+                    pros = ensure_list_str(sonar_info.get("pros", []))
+                    cons = ensure_list_str(sonar_info.get("cons", []))
+                else:
+                    # Если Sonar info нет - оставляем пустые значения (нет fallback)
+                    logger.warning(f"[SONAR] No Sonar info for {analog} - pros/cons will be empty")
+>>>>>>> Stashed changes
                 
                 final_price = price_hint if price_hint else avg_price_math
                 if best_analog_offer and best_analog_offer.price:
@@ -2914,6 +3733,7 @@ def run_pipeline(params: UserInput) -> tuple[list[LeasingOffer], dict, list[dict
             logger.info("DEEP ANALYSIS: Comparing best original with best analogs...")
             logger.info("=" * 70)
             
+<<<<<<< Updated upstream
             comparisons = compare_best_offers_original_vs_analogs(
                 best_original=best_original_offer,
                 best_analogs=best_analog_offers,
@@ -2921,6 +3741,81 @@ def run_pipeline(params: UserInput) -> tuple[list[LeasingOffer], dict, list[dict
                 analyzer=analyzer,
                 use_ai=use_ai
             )
+=======
+            comparisons = {}
+            
+            # Prepare original offer data
+            original_offer_data = {
+                "title": best_original_offer.title,
+                "price": best_original_offer.price,
+                "url": best_original_offer.url
+            }
+            
+            # Use Sonar for comparison if available (compares specific offers with links)
+            sonar_comparison_failed = False
+            if sonar_finder and sonar_finder.is_available():
+                logger.info("[SONAR] Using Sonar to compare offers (with links)...")
+                for analog_name, best_analog in best_analog_offers:
+                    if best_analog:
+                        # Prepare analog offer data
+                        analog_offer_data = {
+                            "title": best_analog.title,
+                            "price": best_analog.price,
+                            "url": best_analog.url
+                        }
+                        
+                        logger.info(f"[SONAR] Comparing with {analog_name}:")
+                        logger.info(f"  Original: {best_original_offer.title[:60]}... -> {best_original_offer.url}")
+                        logger.info(f"  Analog:   {best_analog.title[:60]}... -> {best_analog.url}")
+                        
+                        try:
+                            # Call Sonar to compare specific offers
+                            sonar_comparison = sonar_finder.compare_offers(
+                                original_name=item,
+                                original_offer=original_offer_data,
+                                analog_name=analog_name,
+                                analog_offer=analog_offer_data
+                            )
+                            
+                            # Проверяем, что Sonar вернул валидный результат
+                            if sonar_comparison and sonar_comparison.get("winner") != "unknown":
+                                comparisons[analog_name] = {
+                                    "winner": sonar_comparison.get("winner", "tie"),
+                                    "original_score": 7.0,
+                                    "analog_score": 7.0,
+                                    "price_comparison": {
+                                        "original_price": best_original_offer.price,
+                                        "analog_price": best_analog.price,
+                                        "price_diff": sonar_comparison.get("price_diff", "")
+                                    },
+                                    "pros_original": sonar_comparison.get("original_advantages", []),
+                                    "cons_original": sonar_comparison.get("original_disadvantages", []),
+                                    "pros_analog": sonar_comparison.get("analog_advantages", []),
+                                    "cons_analog": sonar_comparison.get("analog_disadvantages", []),
+                                    "recommendation": sonar_comparison.get("recommendation", ""),
+                                    # ВАЖНО: ссылки на конкретные объявления
+                                    "original_url": best_original_offer.url,
+                                    "analog_url": best_analog.url,
+                                    "original_title": best_original_offer.title,
+                                    "analog_title": best_analog.title,
+                                    "original_price_formatted": format_price(best_original_offer.price),
+                                    "analog_price_formatted": format_price(best_analog.price),
+                                    "sonar_comparison": True
+                                }
+                                
+                                logger.info(f"[SONAR] Winner: {sonar_comparison.get('winner', 'tie')}")
+                            else:
+                                logger.warning(f"[SONAR] Comparison failed for {analog_name} - no fallback available")
+                                # Не добавляем в comparisons - Sonar не смог сравнить
+                        except Exception as e:
+                            logger.error(f"[SONAR] Exception during comparison with {analog_name}: {e}")
+                            logger.error(f"[SONAR] Cannot compare {analog_name} - no fallback available")
+            
+            # Если Sonar недоступен - не делаем сравнений вообще
+            if not sonar_finder or not sonar_finder.is_available():
+                logger.error("[SONAR] Sonar not available - cannot perform comparisons without Sonar")
+                logger.error("[SONAR] No comparisons will be performed")
+>>>>>>> Stashed changes
             
             report["best_offers_comparison"] = comparisons
         

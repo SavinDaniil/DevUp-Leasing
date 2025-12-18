@@ -20,10 +20,108 @@ document.querySelectorAll(".ai-btn").forEach((btn) => {
   });
 });
 
+<<<<<<< Updated upstream
+=======
+// ===== АНИМАЦИЯ ЗАГРУЗКИ =====
+function startLoadingAnimation() {
+  const steps = ["step1", "step2", "step3", "step4"];
+  let currentStep = 0;
+  
+  // Reset all steps
+  steps.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) {
+      el.classList.remove("active", "done");
+    }
+  });
+  
+  // Activate first step
+  const firstStep = document.getElementById(steps[0]);
+  if (firstStep) firstStep.classList.add("active");
+  
+  loadingInterval = setInterval(() => {
+    // Mark current as done
+    const currentEl = document.getElementById(steps[currentStep]);
+    if (currentEl) {
+      currentEl.classList.remove("active");
+      currentEl.classList.add("done");
+    }
+    
+    // Move to next
+    currentStep++;
+    if (currentStep < steps.length) {
+      const nextEl = document.getElementById(steps[currentStep]);
+      if (nextEl) nextEl.classList.add("active");
+    } else {
+      // Loop back
+      currentStep = 0;
+      steps.forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.classList.remove("done");
+      });
+      const firstEl = document.getElementById(steps[0]);
+      if (firstEl) firstEl.classList.add("active");
+    }
+  }, 2500);
+}
+
+function stopLoadingAnimation() {
+  if (loadingInterval) {
+    clearInterval(loadingInterval);
+    loadingInterval = null;
+  }
+}
+
+// ===== ВАЛИДАЦИЯ ФОРМЫ =====
+function validateForm() {
+  const item = document.getElementById("item").value.trim();
+  const clientPrice = document.getElementById("clientPrice").value.trim();
+  const numResults = parseInt(document.getElementById("numResults").value, 10);
+  
+  // Валидация текста
+  if (!item || item.length < 3) {
+    error.textContent = "❌ Описание должно содержать минимум 3 символа";
+    error.classList.add("show");
+    return false;
+  }
+  
+  if (item.length > 500) {
+    error.textContent = "❌ Описание не должно превышать 500 символов";
+    error.classList.add("show");
+    return false;
+  }
+  
+  // Валидация цены
+  if (clientPrice) {
+    const price = parseInt(clientPrice, 10);
+    if (isNaN(price) || price < 0 || price > 10**12) {
+      error.textContent = "❌ Цена должна быть числом от 0 до 1 триллиона";
+      error.classList.add("show");
+      return false;
+    }
+  }
+  
+  // Валидация количества результатов
+  if (isNaN(numResults) || numResults < 1 || numResults > 10) {
+    error.textContent = "❌ Количество результатов должно быть от 1 до 10";
+    error.classList.add("show");
+    return false;
+  }
+  
+  return true;
+}
+
+>>>>>>> Stashed changes
 // ===== ОТПРАВКА ФОРМЫ =====
 form.addEventListener("submit", async (e) => {
   e.preventDefault();
   error.classList.remove("show");
+  
+  // Валидация перед отправкой
+  if (!validateForm()) {
+    return;
+  }
+  
   form.querySelector("button").disabled = true;
 
   console.log("[DEBUG] Форма отправлена");
@@ -44,8 +142,15 @@ form.addEventListener("submit", async (e) => {
   console.log("[DEBUG] numResults:", numResults);
 
   try {
+<<<<<<< Updated upstream
     console.log("[DEBUG] Отправляем запрос на /api/describe");
 
+=======
+    // Таймаут для запроса (5 минут)
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 300000);
+    
+>>>>>>> Stashed changes
     const resp = await fetch("/api/describe", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -55,14 +160,40 @@ form.addEventListener("submit", async (e) => {
         useAI,
         numResults,
       }),
+      signal: controller.signal,
     });
+    
+    clearTimeout(timeoutId);
 
     console.log("[DEBUG] Ответ получен, статус:", resp.status);
 
     if (!resp.ok) {
+<<<<<<< Updated upstream
       const errText = await resp.text();
       console.error("[ERROR] Ответ ошибки:", errText);
       throw new Error("Ошибка сервера: " + resp.status);
+=======
+      let errorMessage = "Ошибка сервера";
+      try {
+        const errorData = await resp.json();
+        errorMessage = errorData.detail || errorData.message || errorMessage;
+      } catch {
+        const errorText = await resp.text();
+        if (errorText) {
+          errorMessage = errorText.substring(0, 200);
+        }
+      }
+      
+      if (resp.status === 429) {
+        errorMessage = "Слишком много запросов. Пожалуйста, подождите минуту перед повторной попыткой.";
+      } else if (resp.status === 400) {
+        errorMessage = "Ошибка валидации: " + errorMessage;
+      } else if (resp.status >= 500) {
+        errorMessage = "Внутренняя ошибка сервера. Пожалуйста, попробуйте позже.";
+      }
+      
+      throw new Error(errorMessage);
+>>>>>>> Stashed changes
     }
 
      const data = await resp.json();
@@ -93,11 +224,30 @@ form.addEventListener("submit", async (e) => {
       updateAnalogCounter();
     }
   } catch (err) {
+<<<<<<< Updated upstream
     console.error("[ERROR]", err.message);
     loading.classList.remove("show");
     placeholder.classList.remove("hidden");
     error.classList.add("show");
     error.textContent = "Ошибка: " + err.message;
+=======
+    console.error("[ERROR]", err);
+    stopLoadingAnimation();
+    loading.classList.remove("show");
+    placeholder.classList.remove("hidden");
+    error.classList.add("show");
+    
+    // Улучшенная обработка различных типов ошибок
+    if (err.name === "AbortError") {
+      error.textContent = "❌ Запрос превысил время ожидания (5 минут). Попробуйте еще раз.";
+    } else if (err.message) {
+      error.textContent = "❌ " + err.message;
+    } else if (err instanceof TypeError && err.message.includes("fetch")) {
+      error.textContent = "❌ Ошибка сети. Проверьте подключение к интернету.";
+    } else {
+      error.textContent = "❌ Произошла неизвестная ошибка. Пожалуйста, попробуйте позже.";
+    }
+>>>>>>> Stashed changes
   } finally {
     form.querySelector("button").disabled = false;
   }
