@@ -83,12 +83,17 @@ class BestOffersComparison(BaseModel):
     recommendation: Optional[str] = None
     use_cases_original: list[str] = []
     use_cases_analog: list[str] = []
+    # Ссылки на объявления для сравнения
     original_url: Optional[str] = None
     analog_url: Optional[str] = None
     original_title: Optional[str] = None
     analog_title: Optional[str] = None
+    # Форматированные цены
+    original_price_formatted: Optional[str] = None
+    analog_price_formatted: Optional[str] = None
     comparison_details: Optional[dict] = None
     key_differences: list[str] = []
+    sonar_comparison: bool = False  # True если сравнение через Sonar
 
 
 class DescribeResponse(BaseModel):
@@ -227,7 +232,7 @@ async def describe(request: DescribeRequest) -> DescribeResponse:
                 ranking=best_original_analysis_raw.get("ranking", [])
             )
         
-        # Convert comparisons
+        # Convert comparisons (includes links to specific offers)
         best_offers_comparison = {}
         for analog_name, comp_data in best_offers_comparison_raw.items():
             best_offers_comparison[analog_name] = BestOffersComparison(
@@ -242,12 +247,17 @@ async def describe(request: DescribeRequest) -> DescribeResponse:
                 recommendation=comp_data.get("recommendation"),
                 use_cases_original=comp_data.get("use_cases_original", []),
                 use_cases_analog=comp_data.get("use_cases_analog", []),
+                # Ссылки на конкретные объявления
                 original_url=comp_data.get("original_url"),
                 analog_url=comp_data.get("analog_url"),
                 original_title=comp_data.get("original_title"),
                 analog_title=comp_data.get("analog_title"),
+                # Форматированные цены
+                original_price_formatted=comp_data.get("original_price_formatted"),
+                analog_price_formatted=comp_data.get("analog_price_formatted"),
                 comparison_details=comp_data.get("comparison_details"),
-                key_differences=comp_data.get("key_differences", [])
+                key_differences=comp_data.get("key_differences", []),
+                sonar_comparison=comp_data.get("sonar_comparison", False)
             )
         
         # Собираем ответ
