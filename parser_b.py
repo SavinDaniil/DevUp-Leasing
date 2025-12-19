@@ -19,6 +19,7 @@ import statistics
 import sys
 import time
 import uuid
+from pathlib import Path
 from abc import ABC, abstractmethod
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -38,9 +39,9 @@ from selenium.webdriver.support.ui import WebDriverWait
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from tqdm import tqdm
 
-from dotenv import load_dotenv
-
-load_dotenv()
+# Load environment variables from .env file located in the same directory as the script
+env_path = Path(__file__).parent / ".env"
+load_dotenv(dotenv_path=env_path)
 
 # =============================
 # Logging configuration
