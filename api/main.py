@@ -1,3 +1,4 @@
+import logging
 import os
 import sys
 from pathlib import Path
@@ -9,18 +10,31 @@ parent_dir = current_dir.parent
 if str(parent_dir) not in sys.path:
     sys.path.insert(0, str(parent_dir))
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 from parser_b import run_analysis
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Leasing descriptor API",
     description="Рыночный анализ предмета лизинга + аналоги",
     version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -30,20 +44,36 @@ static_dir = BASE_DIR / "static"
 if static_dir.exists():
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
+# CORS настройки (безопаснее для продакшена)
+cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:8000,http://127.0.0.1:8000").split(",")
+cors_origins = [origin.strip() for origin in cors_origins if origin.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cors_origins if cors_origins else ["http://localhost:8000"],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
+# Rate limiting
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 
 class DescribeRequest(BaseModel):
-    text: str
-    clientPrice: Optional[int] = None
-    useAI: Optional[bool] = True
-    numResults: Optional[int] = 5
+    text: str = Field(..., min_length=3, max_length=500, description="Описание предмета лизинга")
+    clientPrice: Optional[int] = Field(None, ge=0, le=10**12, description="Цена клиента в рублях")
+    useAI: Optional[bool] = Field(True, description="Использовать AI для анализа")
+    numResults: Optional[int] = Field(5, ge=1, le=10, description="Количество результатов для поиска")
+    
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("Текст не может быть пустым")
+        return v.strip()
 
 
 class AnalogDetail(BaseModel):
@@ -130,24 +160,30 @@ async def root() -> HTMLResponse:
 
 
 @app.post("/api/describe", response_model=DescribeResponse)
-async def describe(request: DescribeRequest) -> DescribeResponse:
+@limiter.limit("10/minute")
+async def describe(request: Request, describe_request: DescribeRequest) -> DescribeResponse:
     """
-    Главный эндпоинт API.
-    1) Берёт text (склеённое описание) и clientPrice
-    2) Запускает run_analysis из parser_b.py
-    3) Преобразует результаты в DescribeResponse:
-       - market_report: диапазон, медиана, отклонение, комментарий
-       - analogs_details: список аналогов для карусели
+    Главный эндпоинт API для анализа предмета лизинга.
+    
+    **Параметры:**
+    - **text**: Описание предмета лизинга (3-500 символов)
+    - **clientPrice**: Цена клиента в рублях (опционально)
+    - **useAI**: Использовать AI для анализа (по умолчанию True)
+    - **numResults**: Количество результатов для поиска (1-10, по умолчанию 5)
+    
+    **Возвращает:**
+    - Рыночный анализ с диапазоном цен, медианой, отклонением
+    - Список аналогов с детальным сравнением
+    - Лучшие предложения с оценками
+    
+    **Rate Limit:** 10 запросов в минуту на IP адрес
     """
-    item_str = request.text.strip()
-    client_price = request.clientPrice
-    use_ai = request.useAI if request.useAI is not None else True
-    num_results = request.numResults if request.numResults else 5
+    item_str = describe_request.text
+    client_price = describe_request.clientPrice
+    use_ai = describe_request.useAI if describe_request.useAI is not None else True
+    num_results = describe_request.numResults if describe_request.numResults else 5
 
-    print(f"[DEBUG] item={item_str[:80]}...")
-    print(f"[DEBUG] client_price={client_price}")
-    print(f"[DEBUG] use_ai={use_ai}")
-    print(f"[DEBUG] num_results={num_results}")
+    logger.info(f"Запрос анализа: item={item_str[:80]}..., client_price={client_price}, use_ai={use_ai}, num_results={num_results}")
 
     try:
         try:
@@ -160,7 +196,7 @@ async def describe(request: DescribeRequest) -> DescribeResponse:
             )
         except OverflowError as e:
             # Защита от int too large to convert to float
-            print(f"[WARN] Overflow в run_analysis: {e}")
+            logger.warning(f"Overflow в run_analysis: {e}")
             analysis = {
                 "item": item_str,
                 "offers_used": [],
@@ -291,26 +327,64 @@ async def describe(request: DescribeRequest) -> DescribeResponse:
             best_offers_comparison=best_offers_comparison,
         )
 
+    except ValueError as e:
+        logger.error(f"Ошибка валидации: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Ошибка валидации входных данных: {str(e)}"
+        )
     except Exception as e:
-        print(f"[ERROR] /api/describe failed: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error(f"Ошибка в /api/describe: {e}", exc_info=True)
+        
+        # Не возвращаем детали ошибки клиенту в продакшене
+        error_message = str(e)[:200] if os.getenv("DEBUG", "false").lower() == "true" else "Внутренняя ошибка сервера"
         
         return DescribeResponse(
             category="Ошибка анализа",
-            vendor=str(e)[:100],
+            vendor=error_message[:100],
             specs={},
             pros=[],
             cons=[],
             analogs_mentioned=[],
             market_report=MarketReport(
-                explanation=f"Ошибка: {str(e)[:200]}"
+                explanation=f"Ошибка при обработке запроса. Пожалуйста, попробуйте позже."
             ),
             analogs_details=[],
         )
 
 
+# Проверка обязательных переменных окружения при старте
+def check_environment():
+    """Проверяет наличие критичных переменных окружения."""
+    warnings = []
+    
+    if not os.getenv("SERPER_API_KEY"):
+        warnings.append("⚠️  SERPER_API_KEY не установлен - поиск через Google может не работать")
+    
+    if not os.getenv("GIGACHAT_AUTH_DATA"):
+        warnings.append("⚠️  GIGACHAT_AUTH_DATA не установлен - AI анализ может быть недоступен")
+    
+    if not os.getenv("PERPLEXITY_API_KEY"):
+        warnings.append("⚠️  PERPLEXITY_API_KEY не установлен - поиск аналогов через Sonar недоступен")
+    
+    if warnings:
+        logger.warning("=" * 70)
+        for warning in warnings:
+            logger.warning(warning)
+        logger.warning("=" * 70)
+    else:
+        logger.info("✅ Все критичные переменные окружения установлены")
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Выполняется при старте приложения."""
+    check_environment()
+    logger.info("🚀 API сервер запущен")
+
+
 if __name__ == "__main__":
     import uvicorn
-
+    
+    check_environment()
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

@@ -1,5 +1,5 @@
 fastapi
-uvicorn
+uvicorn[standard]
 pydantic
 
 requests
@@ -12,3 +12,4 @@ tenacity
 tqdm
 
 python-multipart
+slowapi
