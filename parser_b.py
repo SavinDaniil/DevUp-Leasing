@@ -239,15 +239,9 @@ gigachat_rate_limiter = RateLimiter(
     min_delay=CONFIG.gigachat_min_delay
 )
 sonar_rate_limiter = RateLimiter(
-<<<<<<< HEAD
     CONFIG.sonar_rate_limit_calls,
     CONFIG.sonar_rate_limit_period,
     min_delay=CONFIG.sonar_min_delay
-=======
-    CONFIG.gigachat_rate_limit_calls, 
-    CONFIG.gigachat_rate_limit_period,
-    min_delay=CONFIG.gigachat_min_delay
->>>>>>> aa8e1efddda15c6b70449716150e4ecad9fac560
 )
 
 
@@ -652,14 +646,6 @@ class SonarAnalogResult(TypedDict, total=False):
 
 
 class SonarComparisonResult(TypedDict, total=False):
-<<<<<<< HEAD
-    """Result from Sonar comparison."""
-    winner: str
-    original_advantages: list[str]
-    analog_advantages: list[str]
-    recommendation: str
-    price_verdict: str
-=======
     """Result from Sonar offer comparison."""
     winner: str
     original_advantages: list[str]
@@ -676,7 +662,6 @@ class SonarComparisonResult(TypedDict, total=False):
     analog_title: str
     analog_price: Optional[int]
     sonar_comparison: bool
->>>>>>> aa8e1efddda15c6b70449716150e4ecad9fac560
 
 
 class UserInput(TypedDict):
@@ -1777,12 +1762,8 @@ class SonarAnalogFinder:
                     logger.info(f"[SONAR] Model: {self.model}")
                     logger.debug(f"[SONAR] Payload: {json.dumps(payload, ensure_ascii=False)[:300]}...")
                 
-<<<<<<< HEAD
-                response = _requests_session.post(
-=======
                 # Используем отдельную сессию для Sonar без автоматических retry
                 response = _sonar_requests_session.post(
->>>>>>> aa8e1efddda15c6b70449716150e4ecad9fac560
                     self.api_url,
                     headers=headers,
                     json=payload,
@@ -1893,15 +1874,11 @@ class SonarAnalogFinder:
                 logger.warning(f"[SONAR] HTTP error: {e}")
                 return None
             except requests.RequestException as e:
-<<<<<<< HEAD
                 if attempt < retries and ("500" in str(e) or "timeout" in str(e).lower()):
                     wait_time = (attempt + 1) * 2
                     logger.warning(f"[SONAR] Request error, retrying in {wait_time}s: {e}")
                     time.sleep(wait_time)
                     continue
-                logger.warning(f"[SONAR] Request error: {e}")
-                return None
-=======
                 # Обрабатываем ResponseError от HTTPAdapter (too many 500 errors)
                 error_str = str(e).lower()
                 is_retryable = (
@@ -1923,7 +1900,6 @@ class SonarAnalogFinder:
                         logger.error("[SONAR] This may indicate server overload or temporary unavailability")
                         logger.error("[SONAR] Will use fallback methods (GigaChat/Google)")
                     return None
->>>>>>> aa8e1efddda15c6b70449716150e4ecad9fac560
             except Exception as e:
                 logger.warning(f"[SONAR] Parse error: {e}")
                 return None
@@ -2069,8 +2045,6 @@ class SonarAnalogFinder:
             "analog_price": analog_price,
             "sonar_comparison": True
         }
-<<<<<<< HEAD
-=======
     
     # Промпт для выбора лучшего объявления из списка
     FIND_BEST_OFFER_PROMPT = """Проанализируй список объявлений и выбери ЛУЧШЕЕ по соотношению цена/качество:
@@ -2244,7 +2218,6 @@ class SonarAnalogFinder:
             return None
         
         return result
->>>>>>> aa8e1efddda15c6b70449716150e4ecad9fac560
 
 
 # Global Sonar instance
@@ -3008,7 +2981,6 @@ def collect_analogs(
     sonar_finder: Optional[SonarAnalogFinder] = None
 ) -> tuple[list[str], list[SonarAnalogResult]]:
     """
-<<<<<<< HEAD
     Collect analog models using Sonar as PRIMARY method.
     Sonar always returns exactly 3 analogs.
     
@@ -3090,59 +3062,6 @@ def collect_analogs(
     analog_names = [a for a in analogs_set if a][:3]
     logger.info(f"[FALLBACK] Found {len(analog_names)} analogs via fallback methods")
     return analog_names, sonar_details
-=======
-    Collect analog models using ONLY Sonar API.
-    Sonar always returns exactly 3 analogs.
-    
-    Returns:
-        Tuple of (analog_names, sonar_details)
-        - analog_names: List of analog names (from Sonar, max 3)
-        - sonar_details: Detailed info from Sonar
-    """
-    sonar_details: list[SonarAnalogResult] = []
-    
-    # Check cache first
-    cached_analogs = get_cached_sonar_analogs(item_name)
-    if cached_analogs:
-        logger.info(f"[SONAR] Using cached analogs for '{item_name}'")
-        analog_names = [a["name"] for a in cached_analogs if a.get("name")]
-        return analog_names[:3], cached_analogs[:3]
-    
-    # ONLY Sonar - no fallback methods
-    if not sonar_finder or not sonar_finder.is_available():
-        logger.error("=" * 70)
-        logger.error("[SONAR] Sonar not available - PERPLEXITY_API_KEY not set or invalid format (should start with 'pplx-' or 'sk-')")
-        logger.error("[SONAR] Cannot proceed without Sonar - no fallback methods available")
-        logger.error("=" * 70)
-        return [], []
-    
-    logger.info("=" * 70)
-    logger.info("[SONAR] Searching for analogs using Perplexity Sonar API (ONLY METHOD)")
-    logger.info("=" * 70)
-    
-    try:
-        sonar_details = sonar_finder.find_analogs(item_name)
-        
-        if sonar_details:
-            analog_names = [a["name"] for a in sonar_details if a.get("name")]
-            if analog_names:
-                logger.info(f"[SONAR] Successfully found {len(analog_names)} analogs via Sonar")
-                logger.info(f"[SONAR] Analogs: {', '.join(analog_names)}")
-                # Cache the results
-                cache_sonar_analogs(item_name, sonar_details[:3])
-                # Return exactly 3 (or as many as we have)
-                return analog_names[:3], sonar_details[:3]
-            else:
-                logger.warning("[SONAR] Sonar returned results but no valid analog names")
-                return [], []
-        else:
-            logger.warning("[SONAR] Sonar did not return any analogs")
-            return [], []
-    except Exception as e:
-        logger.error(f"[SONAR] Error during Sonar search: {e}")
-        logger.error("[SONAR] Cannot proceed without Sonar - no fallback methods available")
-        return [], []
->>>>>>> aa8e1efddda15c6b70449716150e4ecad9fac560
 
 
 def fetch_listing_summaries(query: str, top_n: int = 3) -> list[ListingSummary]:
@@ -3862,11 +3781,7 @@ def run_pipeline(params: UserInput) -> tuple[list[LeasingOffer], dict, list[dict
     # Initialize components
     fetcher = SeleniumFetcher()
     cleaner = ContentCleaner()
-<<<<<<< HEAD
     
-=======
-
->>>>>>> aa8e1efddda15c6b70449716150e4ecad9fac560
     # Initialize Sonar for analog search (PRIMARY method)
     sonar_finder = get_sonar_finder()
     if sonar_finder:
@@ -3876,15 +3791,8 @@ def run_pipeline(params: UserInput) -> tuple[list[LeasingOffer], dict, list[dict
     else:
         logger.warning("=" * 70)
         logger.warning("[SONAR] Perplexity API not available - PERPLEXITY_API_KEY not set or invalid format (should start with 'pplx-' or 'sk-')")
-<<<<<<< HEAD
         logger.warning("[SONAR] Will use fallback methods (GigaChat/Google) for analog search")
         logger.warning("=" * 70)
-    
-=======
-        logger.error("[SONAR] Cannot proceed without Sonar - no fallback methods available")
-        logger.warning("=" * 70)
-
->>>>>>> aa8e1efddda15c6b70449716150e4ecad9fac560
     analyzer = None
     if use_ai and CONFIG.gigachat_auth_data:
         client = GigaChatClient(CONFIG.gigachat_auth_data)
@@ -3941,11 +3849,7 @@ def run_pipeline(params: UserInput) -> tuple[list[LeasingOffer], dict, list[dict
                 if enriched_count > 0:
                     logger.info(f"Enriched {enriched_count} offers with technical specifications")
 
-<<<<<<< HEAD
         # Collect analogs (Sonar primary, fallback to GigaChat/Google)
-=======
-        # Collect analogs (ONLY Sonar - no fallback methods)
->>>>>>> aa8e1efddda15c6b70449716150e4ecad9fac560
         analogs, sonar_analog_details = collect_analogs(
             item, offers, use_ai=use_ai, analyzer=analyzer, sonar_finder=sonar_finder
         )
@@ -4031,13 +3935,8 @@ def run_pipeline(params: UserInput) -> tuple[list[LeasingOffer], dict, list[dict
                 listings = fetch_listing_summaries(f"{analog} купить", top_n=3)
                 price_list = [l["price_guess"] for l in listings if l.get("price_guess")]
                 avg_price_math = int(sum(price_list) / len(price_list)) if price_list else None
-<<<<<<< HEAD
                 
                 # Use Sonar info if available, else fallback to GigaChat
-=======
-
-                # Use Sonar info if available (ONLY Sonar - no fallback)
->>>>>>> aa8e1efddda15c6b70449716150e4ecad9fac560
                 pros, cons, note = [], [], ""
                 price_hint = None
                 best_link = None
@@ -4060,7 +3959,6 @@ def run_pipeline(params: UserInput) -> tuple[list[LeasingOffer], dict, list[dict
                     # Если Sonar info нет - оставляем пустые значения (нет fallback)
                     logger.warning(f"[SONAR] No Sonar info for {analog} - pros/cons will be empty")
 
-<<<<<<< HEAD
                 if sonar_info:
                     # Use Sonar description as note
                     note = sonar_info.get("description", "") or sonar_info.get("key_difference", "")
@@ -4075,9 +3973,6 @@ def run_pipeline(params: UserInput) -> tuple[list[LeasingOffer], dict, list[dict
                     price_hint = ai_review.get("price_hint")
                     note = ai_review.get("note", "")
                     best_link = ai_review.get("best_link")
-                
-=======
->>>>>>> aa8e1efddda15c6b70449716150e4ecad9fac560
                 final_price = price_hint if price_hint else avg_price_math
                 if best_analog_offer and best_analog_offer.price:
                     final_price = best_analog_offer.price
@@ -4107,10 +4002,6 @@ def run_pipeline(params: UserInput) -> tuple[list[LeasingOffer], dict, list[dict
             logger.info("=" * 70)
             
             comparisons = {}
-<<<<<<< HEAD
-=======
-            comparisons = {}
->>>>>>> aa8e1efddda15c6b70449716150e4ecad9fac560
             
             # Prepare original offer data
             original_offer_data = {
@@ -4173,7 +4064,6 @@ def run_pipeline(params: UserInput) -> tuple[list[LeasingOffer], dict, list[dict
                                 
                                 logger.info(f"[SONAR] Winner: {sonar_comparison.get('winner', 'tie')}")
                             else:
-<<<<<<< HEAD
                                 logger.warning(f"[SONAR] Comparison failed for {analog_name}, will use fallback")
                                 sonar_comparison_failed = True
                         except Exception as e:
@@ -4201,18 +4091,6 @@ def run_pipeline(params: UserInput) -> tuple[list[LeasingOffer], dict, list[dict
                     if analog_name not in comparisons and analog_name in gigachat_comparisons:
                         comparisons[analog_name] = gigachat_comparisons[analog_name]
                         comparisons[analog_name]["sonar_comparison"] = False
-=======
-                                logger.warning(f"[SONAR] Comparison failed for {analog_name} - no fallback available")
-                                # Не добавляем в comparisons - Sonar не смог сравнить
-                        except Exception as e:
-                            logger.error(f"[SONAR] Exception during comparison with {analog_name}: {e}")
-                            logger.error(f"[SONAR] Cannot compare {analog_name} - no fallback available")
-            
-            # Если Sonar недоступен - не делаем сравнений вообще
-            if not sonar_finder or not sonar_finder.is_available():
-                logger.error("[SONAR] Sonar not available - cannot perform comparisons without Sonar")
-                logger.error("[SONAR] No comparisons will be performed")
->>>>>>> aa8e1efddda15c6b70449716150e4ecad9fac560
             
             report["best_offers_comparison"] = comparisons
         
@@ -4260,7 +4138,7 @@ def run_analysis(
     
     Args:
         item: Item to analyze (e.g., "BMW M5 2024")
-        client_price: Optional client's expected price
+        client_price: Optional client expected price
         use_ai: Whether to use AI analysis
         num_results: Number of search results to process
     
