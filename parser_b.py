@@ -3018,18 +3018,17 @@ def search_and_analyze(
     logger.info(f"Search query: {query}")
     logger.info("=" * 70)
 
+    # Извлекаем название модели из запроса для парсинга
     model_name = extract_model_from_query(query)
-    mandatory_urls = generate_mandatory_urls(model_name)
-    logger.info(f"Mandatory sources: {len(mandatory_urls)}")
-
+    
+    # Убрана проверка обязательных источников - используем только результаты Google
     search_results = search_google(query, num_results * 2)
     if not search_results:
         logger.warning(f"No Google results for query: {query}")
-        filtered_google = []
+        all_results = []
     else:
-        filtered_google = filter_search_results(search_results, num_results)
-
-    all_results = merge_with_mandatory(filtered_google, mandatory_urls)
+        all_results = filter_search_results(search_results, num_results)
+    
     logger.info(f"Total URLs: {len(all_results)}")
 
     if not all_results:

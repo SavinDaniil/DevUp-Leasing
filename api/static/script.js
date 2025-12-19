@@ -139,12 +139,14 @@ form.addEventListener("submit", async (e) => {
     // ✅ ИСПРАВЛЕНО: Создание новых controller и timeout для каждого запроса
     abortController = new AbortController();
     
-    // Таймаут 5 минут (300000 мс) на случай долгого анализа
+    // Таймаут увеличен до 20 минут (1200000 мс) для долгих анализов
     timeoutId = setTimeout(() => {
       abortController.abort();
-      error.textContent = "⏱️ Время ожидания истекло. Попробуйте снова.";
+      stopLoadingAnimation();
+      loading.classList.remove("show");
+      error.textContent = "⏱️ Время ожидания истекло (20 минут). Анализ занял слишком много времени. Попробуйте упростить запрос или уменьшить количество результатов.";
       error.classList.add("show");
-    }, 300000);
+    }, 1200000); // 20 минут
 
     const resp = await fetch("/api/describe", {
       method: "POST",
@@ -197,12 +199,23 @@ form.addEventListener("submit", async (e) => {
     console.error("[ERROR] Ошибка при анализе:", err);
     
     if (err.name === "AbortError") {
-      error.textContent = "❌ Запрос был отменен. Проверьте соединение.";
+      // Проверяем, был ли это таймаут или отмена пользователем
+      if (timeoutId) {
+        error.textContent = "⏱️ Время ожидания истекло (20 минут). Анализ занял слишком много времени. Попробуйте упростить запрос или уменьшить количество результатов.";
+      } else {
+        error.textContent = "❌ Запрос был отменен. Проверьте соединение с сервером.";
+      }
+    } else if (err.message) {
+      // Показываем сообщение об ошибке от сервера
+      error.textContent = `❌ ${err.message}`;
     } else {
-      error.textContent = `❌ Ошибка: ${err.message || "Неизвестная ошибка"}`;
+      error.textContent = "❌ Произошла неизвестная ошибка. Попробуйте позже или проверьте соединение.";
     }
     error.classList.add("show");
   } finally {
+    clearTimeout(timeoutId);
+    timeoutId = null;
+    abortController = null;
     form.querySelector("button").disabled = false;
   }
 });
@@ -337,14 +350,15 @@ function renderSources(sources) {
 
   sources.forEach(s => {
     const li = document.createElement("li");
-    const title = s.title;
+    const title = s.title || "Без названия";
     const src = s.source ? s.source : "";
     const price = s.pricestr ? s.pricestr : "";
 
+    // Всегда показываем заголовок, ссылка опциональна
     if (s.url) {
       li.innerHTML = `<a href="${s.url}" target="_blank" rel="noopener noreferrer">${title}</a><span style="color: var(--muted); font-size: 11px;">${src} ${price}</span>`;
     } else {
-      li.textContent = `${title} ${src} ${price}`;
+      li.innerHTML = `<span>${title}</span><span style="color: var(--muted); font-size: 11px;">${src} ${price}</span>`;
     }
 
     list.appendChild(li);

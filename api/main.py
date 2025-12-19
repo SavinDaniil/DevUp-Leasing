@@ -1,6 +1,7 @@
 import logging
 import os
 import sys
+import asyncio
 from pathlib import Path
 from typing import Optional
 
@@ -182,13 +183,16 @@ async def describe(request: Request, describe_request: DescribeRequest) -> Descr
 
     try:
         try:
-            # Запускаем парсер
-            analysis = run_analysis(
-                item=item_str,
-                client_price=client_price,
-                use_ai=use_ai,
-                num_results=num_results,
+            # ✅ ИСПРАВЛЕНО: Запускаем парсер в отдельном потоке, чтобы не блокировать event loop
+            logger.info("Начало анализа в фоновом потоке...")
+            analysis = await asyncio.to_thread(
+                run_analysis,
+                item_str,
+                client_price,
+                use_ai,
+                num_results
             )
+            logger.info("Анализ завершен успешно")
         except OverflowError as e:
             # Защита от int too large to convert to float
             logger.warning(f"Overflow в run_analysis: {e}")
@@ -207,6 +211,18 @@ async def describe(request: Request, describe_request: DescribeRequest) -> Descr
                     "explanation": "Не удалось посчитать диапазон: данные цен некорректны.",
                 },
             }
+        except TimeoutError as e:
+            logger.error(f"Таймаут при выполнении анализа: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                detail="Анализ занял слишком много времени. Попробуйте упростить запрос или попробовать позже."
+            )
+        except Exception as e:
+            logger.error(f"Ошибка в run_analysis: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Ошибка при выполнении анализа: {str(e)[:200]}"
+            )
 
         # Извлекаем нужные части
         market_report = analysis.get("market_report") or {}
